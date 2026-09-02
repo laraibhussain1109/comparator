@@ -8,7 +8,12 @@ from sklearn.neighbors import NearestNeighbors
 
 class PatchCoreDetector:
     """PatchCore-style normal patch memory using deterministic multi-scale appearance descriptors."""
-    def __init__(self, patch_size=16, stride=8, max_patches=12000): self.patch_size, self.stride, self.max_patches = patch_size, stride, max_patches; self.model=None; self.memory=None
+    def __init__(self, patch_size=16, stride=8, max_memory_patches=12000, *, max_patches=None):
+        # ``max_patches`` remains accepted for callers created by earlier
+        # releases; the public configuration uses ``max_memory_patches``.
+        self.patch_size,self.stride=patch_size,stride
+        self.max_patches=max_memory_patches if max_patches is None else max_patches
+        self.model=None;self.memory=None
     @staticmethod
     def _cpu_workers() -> int:
         """Use the OS logical-core count without joblib's platform probing.

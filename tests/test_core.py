@@ -69,3 +69,9 @@ def test_patchcore_uses_explicit_logical_cpu_count(monkeypatch):
 def test_patchcore_cpu_count_has_safe_fallback(monkeypatch):
     monkeypatch.setattr("src.inspection.patchcore_detector.os.cpu_count", lambda: None)
     assert PatchCoreDetector._cpu_workers()==1
+
+
+def test_patchcore_config_memory_name_maps_to_detector_argument():
+    patchcore_config={"patch_size":12,"stride":6,"max_memory_patches":321}
+    detector=PatchCoreDetector(**patchcore_config)
+    assert detector.max_patches==321
