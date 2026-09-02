@@ -2,7 +2,6 @@ from __future__ import annotations
 from pathlib import Path
 import cv2, json
 import numpy as np
-from sklearn.cluster import KMeans
 from src.utils.image_utils import read_image
 
 
@@ -17,8 +16,16 @@ class GoldenBank:
         directory.mkdir(parents=True, exist_ok=True); feats = np.stack([embedding(x) for x in registered]); count = min(maximum, len(registered))
         if count == len(registered): indices = list(range(count))
         else:
-            model = KMeans(count, random_state=42, n_init=10).fit(feats)
-            indices = [int(np.argmin(np.linalg.norm(feats-model.cluster_centers_[i], axis=1))) for i in range(count)]
+            # Deterministic farthest-first sampling gives a diverse reference
+            # bank without starting sklearn/joblib's Windows core probe.
+            center=feats.mean(axis=0)
+            indices=[int(np.argmin(np.linalg.norm(feats-center,axis=1)))]
+            nearest=np.linalg.norm(feats-feats[indices[0]],axis=1)
+            while len(indices)<count:
+                nearest[indices]=-np.inf
+                candidate=int(np.argmax(nearest))
+                indices.append(candidate)
+                nearest=np.minimum(nearest,np.linalg.norm(feats-feats[candidate],axis=1))
         self.images = [registered[i] for i in indices]; self.names = [source_names[i] for i in indices]; self.features = np.stack([embedding(x) for x in self.images])
         for old in directory.glob("golden_*.png"): old.unlink()
         for n, image in enumerate(self.images): cv2.imwrite(str(directory/f"golden_{n:02d}.png"), image)

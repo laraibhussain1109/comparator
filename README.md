@@ -28,6 +28,17 @@ python -m pip install -r requirements.txt
 
 On Linux, a Qt installation may additionally require the OS packages that provide `libEGL`, `libGL`, and XCB. A CUDA-enabled PyTorch installation is not needed by the portable default backend. The implementation uses CPU-efficient OpenCV/scikit-learn models and automatically reports the host in Technical Details.
 
+The portable backend does not require CUDA and therefore also works on machines
+without an NVIDIA GPU. Its nearest-neighbour index uses the operating system's
+logical CPU count explicitly; this avoids joblib's optional physical-core probe
+(and its `wmic` warning on Windows) while retaining parallel CPU inference.
+The limit is configured as the application package starts, before
+nearest-neighbour code initializes joblib. An existing
+`LOKY_MAX_CPU_COUNT` value is respected.
+Golden-reference selection uses deterministic NumPy farthest-first sampling and
+does not initialize joblib. The known harmless loky physical-core warning is
+also narrowly suppressed because loky has already selected logical cores.
+
 ## Run
 
 1. Copy real images into `dataset/GOOD/` and `dataset/NG/` (at least 3 unique images per class; 10+ is recommended).

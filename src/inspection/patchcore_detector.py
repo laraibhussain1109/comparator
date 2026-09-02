@@ -1,5 +1,6 @@
 from __future__ import annotations
 from pathlib import Path
+import os
 import cv2, joblib
 import numpy as np
 from sklearn.neighbors import NearestNeighbors
@@ -7,7 +8,25 @@ from sklearn.neighbors import NearestNeighbors
 
 class PatchCoreDetector:
     """PatchCore-style normal patch memory using deterministic multi-scale appearance descriptors."""
-    def __init__(self, patch_size=16, stride=8, max_patches=12000): self.patch_size, self.stride, self.max_patches = patch_size, stride, max_patches; self.model=None; self.memory=None
+    def __init__(self, patch_size=16, stride=8, max_memory_patches=12000, *, max_patches=None):
+        # ``max_patches`` remains accepted for callers created by earlier
+        # releases; the public configuration uses ``max_memory_patches``.
+        self.patch_size,self.stride=patch_size,stride
+        self.max_patches=max_memory_patches if max_patches is None else max_patches
+        self.model=None;self.memory=None
+    @staticmethod
+    def _cpu_workers() -> int:
+        """Use the OS logical-core count without joblib's platform probing.
+
+        Recent Windows versions may not include ``wmic``.  Passing ``-1`` to
+        scikit-learn makes joblib invoke that missing command while attempting
+        to discover physical cores.  An explicit positive count has the same
+        graceful logical-core fallback without emitting a misleading warning.
+        """
+        return max(1, os.cpu_count() or 1)
+
+    def _build_index(self) -> None:
+        self.model=NearestNeighbors(n_neighbors=1,n_jobs=self._cpu_workers()).fit(self.memory)
     def _features(self, image: np.ndarray) -> tuple[np.ndarray, list[tuple[int,int]]]:
         lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)/255
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY).astype(np.float32)/255
@@ -20,7 +39,7 @@ class PatchCoreDetector:
     def fit(self, images: list[np.ndarray]) -> None:
         all_features=np.concatenate([self._features(x)[0] for x in images]); rng=np.random.default_rng(42)
         if len(all_features)>self.max_patches: all_features=all_features[rng.choice(len(all_features),self.max_patches,replace=False)]
-        self.memory=all_features; self.model=NearestNeighbors(n_neighbors=1,n_jobs=-1).fit(all_features)
+        self.memory=all_features; self._build_index()
     def predict(self,image:np.ndarray)->tuple[float,np.ndarray]:
         if self.model is None: raise RuntimeError("PatchCore model is not loaded")
         feats,pos=self._features(image); distances=self.model.kneighbors(feats,return_distance=True)[0][:,0]; score_map=np.zeros(image.shape[:2],np.float32); counts=np.zeros_like(score_map)
@@ -28,4 +47,4 @@ class PatchCoreDetector:
         score_map/=np.maximum(counts,1); return float(np.quantile(distances,.99)),score_map
     def save(self,path:Path)->None: path.parent.mkdir(parents=True,exist_ok=True); joblib.dump({"memory":self.memory,"patch_size":self.patch_size,"stride":self.stride,"max_patches":self.max_patches},path)
     def load(self,path:Path)->None:
-        data=joblib.load(path); self.__dict__.update(data); self.model=NearestNeighbors(n_neighbors=1,n_jobs=-1).fit(self.memory)
+        data=joblib.load(path); self.__dict__.update(data); self._build_index()

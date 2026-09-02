@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import cv2,numpy as np
 from src.training.dataset import scan_dataset
 from src.training.splitting import split_dataset
@@ -10,6 +11,23 @@ from src.inspection.temporal_filter import TemporalConfirmation
 from src.inspection.part_state_machine import PartStateMachine,PartState
 from src.inspection.defect_renderer import DefectRenderer
 from src.inspection.types import DefectRegion
+from src.inspection.patchcore_detector import PatchCoreDetector
+from src.inspection.golden_bank import GoldenBank
+
+
+def test_joblib_core_limit_is_configured_before_sklearn_use():
+    assert os.environ["LOKY_MAX_CPU_COUNT"].isdigit()
+    assert int(os.environ["LOKY_MAX_CPU_COUNT"])>=1
+
+
+def test_golden_bank_selects_diverse_references_without_sklearn(tmp_path):
+    images=[]
+    for value in range(10):
+        sample=np.full((32,32,3),value*20,np.uint8)
+        images.append(sample)
+    bank=GoldenBank();bank.build(images,[f"{i}.png" for i in range(10)],tmp_path,3)
+    assert len(bank.images)==3
+    assert len(set(bank.names))==3
 
 def image(circle=True):
     x=np.zeros((160,160,3),np.uint8)
@@ -39,3 +57,21 @@ def test_part_state_counts_once():
     s.update(False);state,_=s.update(False);assert state==PartState.PART_EXITED
 def test_renderer_filters_and_does_not_modify_source():
     src=image();before=src.copy();small=np.array([[[1,1]],[[2,1]],[[2,2]],[[1,2]]]);big=np.array([[[10,10]],[[50,10]],[[50,50]],[[10,50]]]);regions=[DefectRegion("x",small,(1,1,2,2),1,"X"),DefectRegion("x",big,(10,10,40,40),1,"X")];r=DefectRenderer(50);out=r.render(src,regions);assert np.array_equal(src,before);assert not np.array_equal(out,src);assert len(r.filter_regions(regions,src.shape))==1
+
+
+def test_patchcore_uses_explicit_logical_cpu_count(monkeypatch):
+    monkeypatch.setattr("src.inspection.patchcore_detector.os.cpu_count", lambda: 6)
+    detector=PatchCoreDetector(patch_size=16,stride=16,max_patches=100)
+    detector.fit([image()])
+    assert detector.model.n_jobs==6
+
+
+def test_patchcore_cpu_count_has_safe_fallback(monkeypatch):
+    monkeypatch.setattr("src.inspection.patchcore_detector.os.cpu_count", lambda: None)
+    assert PatchCoreDetector._cpu_workers()==1
+
+
+def test_patchcore_config_memory_name_maps_to_detector_argument():
+    patchcore_config={"patch_size":12,"stride":6,"max_memory_patches":321}
+    detector=PatchCoreDetector(**patchcore_config)
+    assert detector.max_patches==321
