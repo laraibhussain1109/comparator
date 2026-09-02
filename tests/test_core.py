@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import cv2,numpy as np
 from src.training.dataset import scan_dataset
 from src.training.splitting import split_dataset
@@ -11,6 +12,11 @@ from src.inspection.part_state_machine import PartStateMachine,PartState
 from src.inspection.defect_renderer import DefectRenderer
 from src.inspection.types import DefectRegion
 from src.inspection.patchcore_detector import PatchCoreDetector
+
+
+def test_joblib_core_limit_is_configured_before_sklearn_use():
+    assert os.environ["LOKY_MAX_CPU_COUNT"].isdigit()
+    assert int(os.environ["LOKY_MAX_CPU_COUNT"])>=1
 
 def image(circle=True):
     x=np.zeros((160,160,3),np.uint8)

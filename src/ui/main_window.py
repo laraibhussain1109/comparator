@@ -11,10 +11,14 @@ from src.ui.inspection_worker import InspectionWorker
 STYLE="""QWidget{background:#111820;color:#e8edf2;font-family:Arial}QPushButton{background:#263747;border:1px solid #587086;border-radius:5px;padding:12px;font-weight:bold;font-size:15px}QPushButton:hover{background:#345067}QPushButton:disabled{color:#65717c;background:#202a32}QProgressBar{border:1px solid #4a5d6d;border-radius:4px;text-align:center}QProgressBar::chunk{background:#168bd2}QGroupBox{border:1px solid #344657;border-radius:5px;margin-top:8px;padding-top:12px}QTextEdit{background:#0b1117;border:1px solid #344657}"""
 class MainWindow(QMainWindow):
     def __init__(self,config):
-        super().__init__();self.c=config;self.counts={"Total":0,"GOOD":0,"NG":0,"RECHECK":0};self.inspector=None;self.training_thread=None;self.started=0;self.setWindowTitle("AI Casting Inspection System");self.resize(1250,900);self.setStyleSheet(STYLE);self._build();self._refresh_trained()
+        super().__init__();self.c=config;self.counts={"Total":0,"GOOD":0,"NG":0,"RECHECK":0};self.inspector=None;self.training_thread=None;self.started=0;self.setWindowTitle("AI Casting Inspection System");self.setStyleSheet(STYLE);self._build();self._fit_to_screen();self._refresh_trained()
+    def _fit_to_screen(self):
+        screen=self.screen()
+        available=screen.availableGeometry() if screen else None
+        self.resize(min(1250,available.width()) if available else 1250,min(900,available.height()) if available else 900)
     def _build(self):
         root=QWidget();layout=QVBoxLayout(root);title=QLabel("AI CASTING INSPECTION SYSTEM");title.setAlignment(Qt.AlignmentFlag.AlignCenter);title.setStyleSheet("font-size:27px;font-weight:bold;padding:12px;color:#dceaf5");layout.addWidget(title)
-        self.video=QLabel("LIVE CAMERA IMAGE\n\nPlace a component in view after training");self.video.setAlignment(Qt.AlignmentFlag.AlignCenter);self.video.setMinimumHeight(430);self.video.setStyleSheet("background:#05090c;border:2px solid #344657;font-size:18px;color:#789");layout.addWidget(self.video,1)
+        self.video=QLabel("LIVE CAMERA IMAGE\n\nPlace a component in view after training");self.video.setAlignment(Qt.AlignmentFlag.AlignCenter);self.video.setMinimumHeight(180);self.video.setStyleSheet("background:#05090c;border:2px solid #344657;font-size:18px;color:#789");layout.addWidget(self.video,1)
         self.result=QLabel("RESULT: READY");self.result.setAlignment(Qt.AlignmentFlag.AlignCenter);self.result.setStyleSheet("font-size:36px;font-weight:bold;color:#8fa6b8;padding:12px");layout.addWidget(self.result)
         stats=QHBoxLayout();self.stat_labels={}
         for key in self.counts:
