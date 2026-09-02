@@ -32,9 +32,12 @@ The portable backend does not require CUDA and therefore also works on machines
 without an NVIDIA GPU. Its nearest-neighbour index uses the operating system's
 logical CPU count explicitly; this avoids joblib's optional physical-core probe
 (and its `wmic` warning on Windows) while retaining parallel CPU inference.
-The limit is configured as the application package starts, before scikit-learn's
-KMeans or nearest-neighbour code initializes joblib. An existing
+The limit is configured as the application package starts, before
+nearest-neighbour code initializes joblib. An existing
 `LOKY_MAX_CPU_COUNT` value is respected.
+Golden-reference selection uses deterministic NumPy farthest-first sampling and
+does not initialize joblib. The known harmless loky physical-core warning is
+also narrowly suppressed because loky has already selected logical cores.
 
 ## Run
 

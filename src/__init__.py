@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import warnings
 
 
 def configure_process_runtime() -> None:
@@ -15,6 +16,17 @@ def configure_process_runtime() -> None:
     An operator-provided value is preserved.
     """
     os.environ.setdefault("LOKY_MAX_CPU_COUNT", str(max(1, os.cpu_count() or 1)))
+    # loky still performs its physical-core probe when the configured limit is
+    # equal to the logical-core count.  The probe's failure is harmless (loky
+    # already falls back to logical cores), but on Windows without WMIC it emits
+    # a large traceback-looking warning.  Suppress only that exact warning;
+    # unrelated joblib warnings remain visible.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"Could not find the number of physical cores.*",
+        category=UserWarning,
+        module=r"joblib\.externals\.loky\.backend\.context",
+    )
 
 
 configure_process_runtime()

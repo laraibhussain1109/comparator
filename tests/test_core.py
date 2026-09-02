@@ -12,11 +12,22 @@ from src.inspection.part_state_machine import PartStateMachine,PartState
 from src.inspection.defect_renderer import DefectRenderer
 from src.inspection.types import DefectRegion
 from src.inspection.patchcore_detector import PatchCoreDetector
+from src.inspection.golden_bank import GoldenBank
 
 
 def test_joblib_core_limit_is_configured_before_sklearn_use():
     assert os.environ["LOKY_MAX_CPU_COUNT"].isdigit()
     assert int(os.environ["LOKY_MAX_CPU_COUNT"])>=1
+
+
+def test_golden_bank_selects_diverse_references_without_sklearn(tmp_path):
+    images=[]
+    for value in range(10):
+        sample=np.full((32,32,3),value*20,np.uint8)
+        images.append(sample)
+    bank=GoldenBank();bank.build(images,[f"{i}.png" for i in range(10)],tmp_path,3)
+    assert len(bank.images)==3
+    assert len(set(bank.names))==3
 
 def image(circle=True):
     x=np.zeros((160,160,3),np.uint8)
