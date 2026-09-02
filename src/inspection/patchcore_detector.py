@@ -3,6 +3,7 @@ from pathlib import Path
 import os
 import cv2, joblib
 import numpy as np
+import logging
 from sklearn.neighbors import NearestNeighbors
 
 
@@ -44,7 +45,7 @@ class PatchCoreDetector:
         if self.model is None: raise RuntimeError("PatchCore model is not loaded")
         feats,pos=self._features(image); distances=self.model.kneighbors(feats,return_distance=True)[0][:,0]; score_map=np.zeros(image.shape[:2],np.float32); counts=np.zeros_like(score_map)
         for d,(x,y) in zip(distances,pos): score_map[y:y+self.patch_size,x:x+self.patch_size]+=d; counts[y:y+self.patch_size,x:x+self.patch_size]+=1
-        score_map/=np.maximum(counts,1); return float(np.quantile(distances,.99)),score_map
+        score_map/=np.maximum(counts,1);score=float(np.quantile(distances,.99));logging.getLogger(__name__).debug("PatchCore image_score=%.6f max_anomaly_map=%.6f",score,float(score_map.max()));return score,score_map
     def save(self,path:Path)->None: path.parent.mkdir(parents=True,exist_ok=True); joblib.dump({"memory":self.memory,"patch_size":self.patch_size,"stride":self.stride,"max_patches":self.max_patches},path)
     def load(self,path:Path)->None:
         data=joblib.load(path); self.__dict__.update(data); self._build_index()

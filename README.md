@@ -7,7 +7,7 @@ A complete, local, ready-to-run visual-inspection prototype for aluminium cast a
 - Pose normalization (foreground, principal orientation, scale/crop, and optional ECC fine alignment) with a low-confidence **RECHECK** result.
 - A representative multi-image golden bank selected by clustered appearance descriptors.
 - A lightweight PatchCore-style nearest-neighbour normal patch memory trained **only on GOOD images**. It produces an internal score map; the GUI never displays it.
-- A supervised GOOD/NG reference-comparison classifier trained from automatically generated logical pairs.
+- A pretrained ConvNeXt-Tiny whole-image binary classifier is the primary GOOD/NG authority. It uses raw logits, CrossEntropyLoss, and one checkpointed class mapping (`0=GOOD`, `1=NG`).
 - Robust learned shape checks using normalized area, aspect, circularity, extent, center, radius and hole count statistics.
 - F2-weighted validation calibration and untouched held-out test reporting.
 - Conservative SSIM/edge-supported localization, morphology and clean red issue contours—never a heatmap.
@@ -55,7 +55,7 @@ The app probes the configured camera first and then other indices. Edit `camera.
 
 ## Training workflow
 
-TRAIN scans supported image formats case-insensitively, validates readability, removes exact duplicates by SHA-256, warns about perceptual duplicates when ImageHash is installed, and creates seeded stratified 70/15/15 splits. It creates the canonical registration template and golden bank, builds the GOOD-only patch memory, trains the supervised comparison model with GOOD and NG, learns the GOOD-only geometry profile, calibrates thresholds exclusively on validation data, evaluates once on the test set, and atomically leaves reusable artifacts. Metrics are calculated from actual held-out predictions and are not synthesized.
+TRAIN scans supported image formats case-insensitively, validates readability, removes exact duplicates by SHA-256, and first runs a mandatory 10 GOOD + 10 NG micro-overfit/reload check. Failure stops full training. It then creates seeded stratified 70/15/15 splits, trains the pretrained binary classifier, builds the GOOD-only PatchCore memory, learns geometry, and calibrates thresholds exclusively on validation data. Metrics are calculated from actual predictions and are not synthesized.
 
 Small datasets necessarily give unstable metrics; collect varied production lighting, pose and harmless surface examples in GOOD, and representative failures in NG.
 
@@ -73,7 +73,7 @@ artifacts/
 ├── golden_bank/golden_*.png
 ├── golden_bank/manifest.json
 ├── patchcore/model.joblib
-├── visual_changenet/model.joblib
+├── classifier/best_classifier.pt
 ├── geometry_profile.json
 ├── thresholds.json
 ├── dataset_split.json

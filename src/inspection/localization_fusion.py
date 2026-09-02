@@ -1,5 +1,5 @@
 from __future__ import annotations
-import cv2
+import cv2,logging
 import numpy as np
 from skimage.metrics import structural_similarity
 from src.inspection.types import DefectRegion
@@ -14,8 +14,9 @@ class DefectLocalizationFusion:
         amap=anomaly_map/(np.quantile(anomaly_map,.995)+1e-8); support=(residual>.20)|(cv2.GaussianBlur(edge,(5,5),0)>.2)
         mask=((amap>=threshold)&support).astype(np.uint8)*255; kernel=np.ones((self.kernel,self.kernel),np.uint8)
         mask=cv2.morphologyEx(mask,cv2.MORPH_OPEN,kernel); mask=cv2.morphologyEx(mask,cv2.MORPH_CLOSE,kernel)
-        contours,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE); regions=[]
+        contours,_=cv2.findContours(mask,cv2.RETR_EXTERNAL,cv2.CHAIN_APPROX_SIMPLE); regions=[];areas=[float(cv2.contourArea(c)) for c in contours]
         for c in contours:
             area=cv2.contourArea(c); x,y,w,h=cv2.boundingRect(c)
             if area>=self.min_area and min(w,h)>=3: regions.append(DefectRegion("appearance",c,(x,y,w,h),float(np.clip(amap[y:y+h,x:x+w].max(),0,1)),"PATCHCORE+RESIDUAL"))
+        logging.getLogger(__name__).debug("PatchCore localization max_pixel_score=%.6f pixel_threshold=%.6f components_before_filter=%d areas=%s minimum_area=%d components_after_filter=%d",float(amap.max()),threshold,len(contours),areas,self.min_area,len(regions))
         return regions+geometry_regions

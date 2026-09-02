@@ -9,6 +9,10 @@ camera:
   width: 1280
   height: 720
 image_size: 384
+classifier:
+  image_size: 224
+  sanity_epochs: 120
+  epochs: 30
 registration:
   min_confidence: 0.42
   ecc_enabled: true
