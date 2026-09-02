@@ -5,7 +5,7 @@ from typing import Callable
 import json, logging, time
 from PIL import Image
 from src.models.classifier import ARCHITECTURE, CLASS_NAMES, assert_logits, create_classifier, require_torch
-from src.models.preprocessing import PreprocessingConfig, get_eval_transform, get_train_transform
+from src.models.preprocessing import PreprocessingConfig, get_eval_transform
 from src.training.threshold_calibration import calibrate_threshold, metrics
 
 log=logging.getLogger(__name__)
@@ -85,8 +85,17 @@ def run_micro_overfit(good,ng,artifact_dir,preprocessing,epochs=120,progress=Non
 
 def train_classifier(split,artifact_dir,image_size=224,epochs=30,progress=None):
     torch,_=require_torch();device=_device(torch);prep=PreprocessingConfig(image_size);counts=[sum(s.label==i for s in split.train) for i in (0,1)];ratio=max(counts)/min(counts);weights=[len(split.train)/(2*c) for c in counts] if ratio>=1.5 else None
-    log.info("Full classifier device=%s hardware=%s train_images=%d class_counts=%s class_weights=%s",device,hardware_details(),len(split.train),counts,weights);model=create_classifier(True,True).to(device);_train(model,split.train,get_train_transform(prep),device,epochs,1e-3,weights,progress)
-    labels,probs,_=evaluate(model,split.validation,get_eval_transform(prep),device);threshold,val=calibrate_threshold(labels,probs)
+    # A frozen backbone caches each image once.  It must cache the deterministic
+    # evaluation representation: caching one random augmented view makes the
+    # displayed 100% training accuracy refer to different tensors than GUI
+    # inference and caused the acceptance verification to fail.
+    eval_transform=get_eval_transform(prep)
+    log.info("Full classifier device=%s hardware=%s train_images=%d class_counts=%s class_weights=%s",device,hardware_details(),len(split.train),counts,weights);model=create_classifier(True,True).to(device);_train(model,split.train,eval_transform,device,epochs,1e-3,weights,progress)
+    labels,probs,_=evaluate(model,split.validation,eval_transform,device);calibrated_threshold,val=calibrate_threshold(labels,probs)
+    threshold=min(.5,calibrated_threshold)
+    if threshold != calibrated_threshold:
+        log.info("Classifier threshold %.6f was conservatively capped at 0.5 to preserve the standard two-logit decision boundary and NG recall",calibrated_threshold)
+        val=metrics(labels,probs,threshold)
     path=artifact_dir/"classifier"/"best_classifier.pt";save_checkpoint(path,model,prep,epochs,val,threshold);pre_labels,pre_probs,_=evaluate(model,split.validation,get_eval_transform(prep),device,threshold);pre=metrics(pre_labels,pre_probs,threshold)
     del model
     if torch.cuda.is_available():torch.cuda.empty_cache()
@@ -100,9 +109,17 @@ def train_classifier(split,artifact_dir,image_size=224,epochs=30,progress=None):
         results[name]=metrics(ys,ps,threshold);mis=artifact_dir/"diagnostics"/f"{name}_misclassified";mis.mkdir(parents=True,exist_ok=True)
         for i,row in enumerate(r for r in rows if r["predicted"]!=r["true_label"]):(mis/f"{i:04d}.json").write_text(json.dumps(row,indent=2))
     if abs(results["validation"]["accuracy"]-pre["accuracy"])>1e-6:raise RuntimeError("CHECKPOINT VERIFICATION FAILED: reloaded predictions differ from pre-save model")
-    verify={}
+    verify={};verification_rows=[]
     for label,name in CLASS_NAMES.items():
-        chosen=[s for s in split.train if s.label==label][:10];verify[name]={"correct":sum(inference.predict(s.path)["predicted_index"]==label for s in chosen),"total":len(chosen)}
+        chosen=[s for s in split.train if s.label==label][:10];rows=[]
+        for sample in chosen:
+            prediction=inference.predict(sample.path);row={"filename":str(sample.path),"true_label":name,**prediction};rows.append(row);verification_rows.append(row)
+            log.info("TRAINING verification %s true=%s predicted=%s GOOD=%.6f NG=%.6f threshold=%.6f",sample.path,name,prediction["predicted"],prediction["good_probability"],prediction["ng_probability"],prediction["threshold"])
+        verify[name]={"correct":sum(row["predicted_index"]==label for row in rows),"total":len(rows)}
+    verification_path=artifact_dir/"diagnostics"/"training_inference_verification.json";verification_path.parent.mkdir(parents=True,exist_ok=True);verification_path.write_text(json.dumps(verification_rows,indent=2))
     log.info("TRAINING INFERENCE VERIFICATION GOOD: %s/%s NG: %s/%s",verify["GOOD"]["correct"],verify["GOOD"]["total"],verify["NG"]["correct"],verify["NG"]["total"])
-    if verify["NG"]["correct"] != verify["NG"]["total"]:raise RuntimeError("TRAINING INFERENCE VERIFICATION FAILED: an NG training image was classified GOOD")
+    failed_ng=[row for row in verification_rows if row["true_label"]=="NG" and row["predicted"]!="NG"]
+    if failed_ng:
+        details="; ".join(f"{Path(row['filename']).name} NG={row['ng_probability']:.6f}" for row in failed_ng)
+        raise RuntimeError(f"TRAINING INFERENCE VERIFICATION FAILED: {len(failed_ng)} NG training image(s) classified GOOD at threshold {threshold:.6f}: {details}. Full training stopped; details saved to {verification_path}")
     return {"checkpoint":str(path),"threshold":threshold,"validation_calibration":val,"metrics":results,"verification":verify,"checkpoint_verification":"PASS","preprocessing":prep.metadata(),"device":device}

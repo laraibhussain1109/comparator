@@ -50,6 +50,8 @@ def test_registration_and_geometry():
     features,contour=extract_geometry(image());assert contour is not None;assert .8<features["circularity"]<1.1
 def test_calibration_prefers_ng_recall():
     threshold,result=calibrate_threshold([0,0,1,1],[.1,.2,.25,.9]);assert result["ng_recall"]==1;assert .2<threshold<=.25
+def test_calibration_tie_prefers_conservative_lower_threshold():
+    threshold,result=calibrate_threshold([0,0,1,1],[.1,.2,.8,.9]);assert result["f2"]==1;assert threshold==.5
 def test_hierarchical_decision():
     d=DecisionEngine({"registration_confidence":.4,"geometry_tolerance":4,"classifier_ng_threshold":.6,"patchcore_image":.7})
     assert d.decide(.2,True,9,1,1,2)=="RECHECK";assert d.decide(.8,True,5,0,0,0)=="NG";assert d.decide(.8,False,0,.7,.2,0)=="NG";assert d.decide(.8,False,0,.4,1,2)=="GOOD"
