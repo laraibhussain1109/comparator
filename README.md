@@ -59,6 +59,8 @@ TRAIN scans supported image formats case-insensitively, validates readability, r
 
 During the initial classifier phase the pretrained ConvNeXt feature extractor is intentionally frozen; only the new binary head is optimized. This is not a stalled process: frozen features are cached in one pass, and the GUI/log displays every epoch with loss, accuracy, elapsed time, selected device, and hardware details. This makes CPU training substantially faster while retaining the requested head-first training strategy.
 
+The default configuration targets 3840×2160 (8.3 MP) capture. Classification uses a 512×512 letterboxed input and PatchCore/registration use a 768×768 canonical image so visible defects are not discarded by the former 224/384 reductions. Changing either resolution requires pressing **TRAIN**; inspection rejects an older incompatible classifier checkpoint instead of silently using it.
+
 Small datasets necessarily give unstable metrics; collect varied production lighting, pose and harmless surface examples in GOOD, and representative failures in NG.
 
 ## Inspection workflow

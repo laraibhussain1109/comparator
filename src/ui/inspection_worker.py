@@ -25,6 +25,9 @@ class InspectionWorker(QThread):
                 candidate.release()
             if cap is None:raise RuntimeError("No camera could be opened. Check the connection and camera index in Settings/config.yaml.")
             cap.set(cv2.CAP_PROP_FRAME_WIDTH,self.c["camera"]["width"]);cap.set(cv2.CAP_PROP_FRAME_HEIGHT,self.c["camera"]["height"])
+            actual_width=round(cap.get(cv2.CAP_PROP_FRAME_WIDTH));actual_height=round(cap.get(cv2.CAP_PROP_FRAME_HEIGHT));requested=(self.c["camera"]["width"],self.c["camera"]["height"])
+            if (actual_width,actual_height)!=requested:self.event.emit(f"WARNING: Camera rejected requested {requested[0]}x{requested[1]}; actual capture is {actual_width}x{actual_height}")
+            else:self.event.emit(f"Camera capture resolution verified: {actual_width}x{actual_height}")
             while self.running and not self.isInterruptionRequested():
                 ok,frame=cap.read()
                 if not ok:time.sleep(.05);continue

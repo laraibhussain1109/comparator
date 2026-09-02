@@ -4,30 +4,37 @@ paths:
   results: ./inspection_results
   logs: ./logs
 camera:
-  index: 0
+  index: 1
   probe_count: 5
-  width: 1280
-  height: 720
-image_size: 384
+  width: 3840
+  height: 2160
+# Registration/PatchCore work on a larger canonical image so small casting
+# defects are not erased when an 8.3 MP frame is normalized.
+image_size: 768
 classifier:
-  image_size: 224
+  # 224 px reduced a 3840x2160 source by 17x and removed small defects.
+  # ConvNeXt is fully convolutional and supports this higher input resolution.
+  image_size: 512
+  batch_size: 2
   sanity_epochs: 120
   epochs: 30
 registration:
   min_confidence: 0.42
-  ecc_enabled: true
+  # Avoid a fine warp changing or smoothing the defect presented to PatchCore.
+  ecc_enabled: false
   foreground_min_area_ratio: 0.06
 golden_bank:
-  max_images: 8
+  max_images: 12
 patchcore:
-  patch_size: 16
-  stride: 8
-  max_memory_patches: 12000
+  patch_size: 12
+  stride: 6
+  max_memory_patches: 18000
 geometry:
   tolerance_multiplier: 4.0
 localization:
-  minimum_defect_area: 90
-  morphology_kernel: 5
+  # Preserve small genuine components at the 768 px canonical resolution.
+  minimum_defect_area: 40
+  morphology_kernel: 3
   merge_distance: 12
 temporal:
   window: 5
