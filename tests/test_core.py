@@ -13,6 +13,9 @@ from src.inspection.defect_renderer import DefectRenderer
 from src.inspection.types import DefectRegion
 from src.inspection.patchcore_detector import PatchCoreDetector
 from src.inspection.golden_bank import GoldenBank
+from src.models.classifier import CLASS_NAMES,validate_class_mapping
+from src.models.preprocessing import bgr_to_rgb
+from src.models.classifier_trainer import hardware_details
 
 
 def test_joblib_core_limit_is_configured_before_sklearn_use():
@@ -47,9 +50,19 @@ def test_registration_and_geometry():
     features,contour=extract_geometry(image());assert contour is not None;assert .8<features["circularity"]<1.1
 def test_calibration_prefers_ng_recall():
     threshold,result=calibrate_threshold([0,0,1,1],[.1,.2,.25,.9]);assert result["ng_recall"]==1;assert .2<threshold<=.25
+def test_calibration_tie_prefers_conservative_lower_threshold():
+    threshold,result=calibrate_threshold([0,0,1,1],[.1,.2,.8,.9]);assert result["f2"]==1;assert threshold==.5
 def test_hierarchical_decision():
-    d=DecisionEngine({"registration_confidence":.4,"geometry_tolerance":4,"visual_change":.6,"patchcore_image":.7})
-    assert d.decide(.2,True,9,1,1,2)=="RECHECK";assert d.decide(.8,True,5,0,0,0)=="NG";assert d.decide(.8,False,0,.7,.2,0)=="GOOD"
+    d=DecisionEngine({"registration_confidence":.4,"geometry_tolerance":4,"classifier_ng_threshold":.6,"patchcore_image":.7})
+    assert d.decide(.2,True,9,1,1,2)=="RECHECK";assert d.decide(.8,True,5,0,0,0)=="NG";assert d.decide(.8,False,0,.7,.2,0)=="NG";assert d.decide(.8,False,0,.4,1,2)=="GOOD"
+
+def test_canonical_mapping_and_bgr_conversion():
+    assert CLASS_NAMES=={0:"GOOD",1:"NG"};validate_class_mapping({0:"GOOD",1:"NG"})
+    pixel=np.array([[[1,2,3]]],np.uint8);assert bgr_to_rgb(pixel).tolist()==[[[3,2,1]]]
+
+def test_hardware_diagnostics_are_complete():
+    pytest=__import__("pytest");pytest.importorskip("torch");details=hardware_details()
+    assert {"torch_version","cuda_available","cuda_version","gpu_name"}<=details.keys()
 def test_temporal_voting():
     t=TemporalConfirmation(5,3);assert [t.update("NG") for _ in range(3)]==["RECHECK","RECHECK","NG"]
 def test_part_state_counts_once():
