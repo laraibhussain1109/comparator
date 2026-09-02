@@ -1,0 +1,44 @@
+paths:
+  dataset: ./dataset
+  artifacts: ./artifacts
+  results: ./inspection_results
+  logs: ./logs
+camera:
+  index: 0
+  probe_count: 5
+  width: 1280
+  height: 720
+image_size: 384
+registration:
+  min_confidence: 0.42
+  ecc_enabled: true
+  foreground_min_area_ratio: 0.06
+golden_bank:
+  max_images: 8
+patchcore:
+  patch_size: 16
+  stride: 8
+  max_memory_patches: 12000
+geometry:
+  tolerance_multiplier: 4.0
+localization:
+  minimum_defect_area: 90
+  morphology_kernel: 5
+  merge_distance: 12
+temporal:
+  window: 5
+  confirmation_count: 3
+  immediate_critical: true
+inspection:
+  presence_area_ratio: 0.06
+  absence_frames: 4
+  save_good_events: false
+  save_ng_events: true
+visual_change:
+  backend: sklearn
+  require_tao: false
+  tao_command: tao
+runtime:
+  cuda_device: auto
+  log_level: INFO
+  random_seed: 42
