@@ -10,6 +10,7 @@ from src.inspection.temporal_filter import TemporalConfirmation
 from src.inspection.part_state_machine import PartStateMachine,PartState
 from src.inspection.defect_renderer import DefectRenderer
 from src.inspection.types import DefectRegion
+from src.inspection.patchcore_detector import PatchCoreDetector
 
 def image(circle=True):
     x=np.zeros((160,160,3),np.uint8)
@@ -39,3 +40,15 @@ def test_part_state_counts_once():
     s.update(False);state,_=s.update(False);assert state==PartState.PART_EXITED
 def test_renderer_filters_and_does_not_modify_source():
     src=image();before=src.copy();small=np.array([[[1,1]],[[2,1]],[[2,2]],[[1,2]]]);big=np.array([[[10,10]],[[50,10]],[[50,50]],[[10,50]]]);regions=[DefectRegion("x",small,(1,1,2,2),1,"X"),DefectRegion("x",big,(10,10,40,40),1,"X")];r=DefectRenderer(50);out=r.render(src,regions);assert np.array_equal(src,before);assert not np.array_equal(out,src);assert len(r.filter_regions(regions,src.shape))==1
+
+
+def test_patchcore_uses_explicit_logical_cpu_count(monkeypatch):
+    monkeypatch.setattr("src.inspection.patchcore_detector.os.cpu_count", lambda: 6)
+    detector=PatchCoreDetector(patch_size=16,stride=16,max_patches=100)
+    detector.fit([image()])
+    assert detector.model.n_jobs==6
+
+
+def test_patchcore_cpu_count_has_safe_fallback(monkeypatch):
+    monkeypatch.setattr("src.inspection.patchcore_detector.os.cpu_count", lambda: None)
+    assert PatchCoreDetector._cpu_workers()==1
