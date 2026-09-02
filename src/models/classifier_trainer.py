@@ -1,7 +1,8 @@
 from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
-import json, logging
+from typing import Callable
+import json, logging, time
 from PIL import Image
 from src.models.classifier import ARCHITECTURE, CLASS_NAMES, assert_logits, create_classifier, require_torch
 from src.models.preprocessing import PreprocessingConfig, get_eval_transform, get_train_transform
@@ -24,7 +25,7 @@ def hardware_details():
     torch,_=require_torch();return {"torch_version":torch.__version__,"cuda_available":torch.cuda.is_available(),"cuda_version":torch.version.cuda,"gpu_name":torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"}
 
 def _loader(samples,transform,batch=8,shuffle=False):
-    torch,_=require_torch();return torch.utils.data.DataLoader(ImageDataset(samples,transform),batch_size=batch,shuffle=shuffle,num_workers=0)
+    torch,_=require_torch();return torch.utils.data.DataLoader(ImageDataset(samples,transform),batch_size=batch,shuffle=shuffle,num_workers=0,pin_memory=torch.cuda.is_available())
 
 def evaluate(model,samples,transform,device,threshold=.5):
     torch,_=require_torch();model.eval();labels=[];ng=[];rows=[]
@@ -39,22 +40,40 @@ def save_checkpoint(path,model,preprocessing,epoch,validation_metrics,threshold)
     torch,_=require_torch();path.parent.mkdir(parents=True,exist_ok=True)
     torch.save({"model_state_dict":model.state_dict(),"architecture":ARCHITECTURE,"class_mapping":CLASS_NAMES,"preprocessing":preprocessing.metadata(),"epoch":epoch,"validation_metrics":validation_metrics,"thresholds":{"classifier_ng_threshold":threshold},"training_timestamp":datetime.now(timezone.utc).isoformat()},path)
 
-def _train(model,samples,transform,device,epochs,lr,class_weights=None):
+def _train(model,samples,transform,device,epochs,lr,class_weights=None,progress:Callable[[int,float,float],None]|None=None):
     torch,_=require_torch();trainable=[p for p in model.parameters() if p.requires_grad]
     if not trainable:raise RuntimeError("Classifier has no trainable parameters")
     optimizer=torch.optim.AdamW(trainable,lr=lr,weight_decay=1e-4)
     weight=torch.tensor(class_weights,dtype=torch.float32,device=device) if class_weights else None;loss_fn=torch.nn.CrossEntropyLoss(weight=weight)
-    last_loss=0.
+    frozen_backbone=not any(parameter.requires_grad for parameter in model.features.parameters())
+    cached_features=[];cached_labels=[]
+    if frozen_backbone:
+        log.info("Caching frozen ConvNeXt features once for %d images on %s; subsequent head epochs are fast",len(samples),device)
+        model.eval()
+        with torch.inference_mode():
+            for inputs,labels,_ in _loader(samples,transform):
+                inputs=inputs.to(device,non_blocking=True);cached_features.append(model.avgpool(model.features(inputs)).cpu());cached_labels.append(labels)
+        feature_dataset=torch.utils.data.TensorDataset(torch.cat(cached_features),torch.cat(cached_labels))
+    last_loss=0.;started=time.monotonic()
     for epoch in range(epochs):
-        model.train()
-        for inputs,labels,_ in _loader(samples,transform,shuffle=True):
-            labels=labels.to(device);optimizer.zero_grad(set_to_none=True);logits=model(inputs.to(device));assert_logits(logits);loss=loss_fn(logits,labels);loss.backward();optimizer.step();last_loss=float(loss)
+        model.classifier.train();correct=0;seen=0;loss_total=0.
+        if frozen_backbone:
+            batches=torch.utils.data.DataLoader(feature_dataset,batch_size=8,shuffle=True,pin_memory=torch.cuda.is_available())
+            for features,labels in batches:
+                labels=labels.to(device,non_blocking=True);optimizer.zero_grad(set_to_none=True);logits=model.classifier(features.to(device,non_blocking=True));assert_logits(logits);loss=loss_fn(logits,labels);loss.backward();optimizer.step();batch_size=len(labels);loss_total+=float(loss)*batch_size;correct+=int((logits.argmax(1)==labels).sum());seen+=batch_size
+        else:
+            model.train()
+            for inputs,labels,_ in _loader(samples,transform,shuffle=True):
+                labels=labels.to(device);optimizer.zero_grad(set_to_none=True);logits=model(inputs.to(device));assert_logits(logits);loss=loss_fn(logits,labels);loss.backward();optimizer.step();batch_size=len(labels);loss_total+=float(loss)*batch_size;correct+=int((logits.argmax(1)==labels).sum());seen+=batch_size
+        last_loss=loss_total/max(seen,1);accuracy=correct/max(seen,1);elapsed=time.monotonic()-started
+        log.info("Classifier epoch %d/%d loss=%.6f accuracy=%.1f%% elapsed=%.1fs",epoch+1,epochs,last_loss,100*accuracy,elapsed)
+        if progress:progress(epoch+1,last_loss,accuracy)
     return last_loss
 
-def run_micro_overfit(good,ng,artifact_dir,preprocessing,epochs=120):
+def run_micro_overfit(good,ng,artifact_dir,preprocessing,epochs=120,progress=None):
     if len(good)<10 or len(ng)<10:raise RuntimeError(f"SANITY CHECK FAILED: requires 10 GOOD and 10 NG unique images; found {len(good)} GOOD and {len(ng)} NG. Full training has been stopped.")
     torch,_=require_torch();samples=list(good[:10])+list(ng[:10]);device=_device(torch);model=create_classifier(True,True).to(device)
-    loss=_train(model,samples,get_eval_transform(preprocessing),device,epochs,1e-3);path=artifact_dir/"classifier"/"sanity_classifier.pt";save_checkpoint(path,model,preprocessing,epochs,{"sanity":True},.5)
+    log.info("Sanity classifier device=%s hardware=%s",device,hardware_details());loss=_train(model,samples,get_eval_transform(preprocessing),device,epochs,1e-3,progress=progress);path=artifact_dir/"classifier"/"sanity_classifier.pt";save_checkpoint(path,model,preprocessing,epochs,{"sanity":True},.5)
     del model
     if torch.cuda.is_available():torch.cuda.empty_cache()
     from src.models.classifier_inference import ClassifierInference
@@ -64,9 +83,9 @@ def run_micro_overfit(good,ng,artifact_dir,preprocessing,epochs=120):
     if correct<20:raise RuntimeError(f"SANITY CHECK FAILED ({correct}/20): The model cannot correctly learn the training subset. Full training has been stopped.")
     return {"correct":correct,"total":20,"loss":loss,"checkpoint":str(path)}
 
-def train_classifier(split,artifact_dir,image_size=224,epochs=30):
+def train_classifier(split,artifact_dir,image_size=224,epochs=30,progress=None):
     torch,_=require_torch();device=_device(torch);prep=PreprocessingConfig(image_size);counts=[sum(s.label==i for s in split.train) for i in (0,1)];ratio=max(counts)/min(counts);weights=[len(split.train)/(2*c) for c in counts] if ratio>=1.5 else None
-    model=create_classifier(True,True).to(device);_train(model,split.train,get_train_transform(prep),device,epochs,1e-3,weights)
+    log.info("Full classifier device=%s hardware=%s train_images=%d class_counts=%s class_weights=%s",device,hardware_details(),len(split.train),counts,weights);model=create_classifier(True,True).to(device);_train(model,split.train,get_train_transform(prep),device,epochs,1e-3,weights,progress)
     labels,probs,_=evaluate(model,split.validation,get_eval_transform(prep),device);threshold,val=calibrate_threshold(labels,probs)
     path=artifact_dir/"classifier"/"best_classifier.pt";save_checkpoint(path,model,prep,epochs,val,threshold);pre_labels,pre_probs,_=evaluate(model,split.validation,get_eval_transform(prep),device,threshold);pre=metrics(pre_labels,pre_probs,threshold)
     del model

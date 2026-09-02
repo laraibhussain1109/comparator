@@ -15,6 +15,7 @@ from src.inspection.patchcore_detector import PatchCoreDetector
 from src.inspection.golden_bank import GoldenBank
 from src.models.classifier import CLASS_NAMES,validate_class_mapping
 from src.models.preprocessing import bgr_to_rgb
+from src.models.classifier_trainer import hardware_details
 
 
 def test_joblib_core_limit_is_configured_before_sklearn_use():
@@ -56,6 +57,10 @@ def test_hierarchical_decision():
 def test_canonical_mapping_and_bgr_conversion():
     assert CLASS_NAMES=={0:"GOOD",1:"NG"};validate_class_mapping({0:"GOOD",1:"NG"})
     pixel=np.array([[[1,2,3]]],np.uint8);assert bgr_to_rgb(pixel).tolist()==[[[3,2,1]]]
+
+def test_hardware_diagnostics_are_complete():
+    pytest=__import__("pytest");pytest.importorskip("torch");details=hardware_details()
+    assert {"torch_version","cuda_available","cuda_version","gpu_name"}<=details.keys()
 def test_temporal_voting():
     t=TemporalConfirmation(5,3);assert [t.update("NG") for _ in range(3)]==["RECHECK","RECHECK","NG"]
 def test_part_state_counts_once():

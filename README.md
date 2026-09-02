@@ -57,6 +57,8 @@ The app probes the configured camera first and then other indices. Edit `camera.
 
 TRAIN scans supported image formats case-insensitively, validates readability, removes exact duplicates by SHA-256, and first runs a mandatory 10 GOOD + 10 NG micro-overfit/reload check. Failure stops full training. It then creates seeded stratified 70/15/15 splits, trains the pretrained binary classifier, builds the GOOD-only PatchCore memory, learns geometry, and calibrates thresholds exclusively on validation data. Metrics are calculated from actual predictions and are not synthesized.
 
+During the initial classifier phase the pretrained ConvNeXt feature extractor is intentionally frozen; only the new binary head is optimized. This is not a stalled process: frozen features are cached in one pass, and the GUI/log displays every epoch with loss, accuracy, elapsed time, selected device, and hardware details. This makes CPU training substantially faster while retaining the requested head-first training strategy.
+
 Small datasets necessarily give unstable metrics; collect varied production lighting, pose and harmless surface examples in GOOD, and representative failures in NG.
 
 ## Inspection workflow
