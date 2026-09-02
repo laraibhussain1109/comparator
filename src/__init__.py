@@ -1,0 +1,1 @@
+"""Industrial casting inspection prototype."""
