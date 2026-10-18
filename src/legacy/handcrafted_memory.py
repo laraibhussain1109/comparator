@@ -1,3 +1,4 @@
+"""Deprecated characterization baseline. Never used by NeuroIris runtime or training."""
 from __future__ import annotations
 from pathlib import Path
 import os
@@ -6,8 +7,12 @@ import numpy as np
 from sklearn.neighbors import NearestNeighbors
 
 
-class PatchCoreDetector:
-    """PatchCore-style normal patch memory using deterministic multi-scale appearance descriptors."""
+class HandcraftedPatchMemory:
+    """Legacy LAB/Sobel patch statistics with nearest-neighbour memory.
+
+    This CPU baseline has no pretrained deep features and is not PatchCore.
+    It is excluded from the native-resolution inspection application.
+    """
     def __init__(self, patch_size=16, stride=8, max_memory_patches=12000, *, max_patches=None):
         # ``max_patches`` remains accepted for callers created by earlier
         # releases; the public configuration uses ``max_memory_patches``.
@@ -41,7 +46,7 @@ class PatchCoreDetector:
         if len(all_features)>self.max_patches: all_features=all_features[rng.choice(len(all_features),self.max_patches,replace=False)]
         self.memory=all_features; self._build_index()
     def predict(self,image:np.ndarray)->tuple[float,np.ndarray]:
-        if self.model is None: raise RuntimeError("PatchCore model is not loaded")
+        if self.model is None: raise RuntimeError("Handcrafted patch memory is not loaded")
         feats,pos=self._features(image); distances=self.model.kneighbors(feats,return_distance=True)[0][:,0]; score_map=np.zeros(image.shape[:2],np.float32); counts=np.zeros_like(score_map)
         for d,(x,y) in zip(distances,pos): score_map[y:y+self.patch_size,x:x+self.patch_size]+=d; counts[y:y+self.patch_size,x:x+self.patch_size]+=1
         score_map/=np.maximum(counts,1); return float(np.quantile(distances,.99)),score_map

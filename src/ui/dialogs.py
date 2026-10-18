@@ -1,0 +1,883 @@
+"""Functional operator and technician dialogs for NeuroIris."""
+from __future__ import annotations
+
+import csv
+import json
+import time
+from pathlib import Path
+from typing import Any, Callable
+
+import cv2
+import numpy as np
+from PyQt6.QtCore import QThread, QTimer, Qt
+from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
+    QHeaderView, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QProgressBar,
+    QPushButton, QScrollArea, QSpinBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
+    QTextEdit, QVBoxLayout, QWidget)
+
+from src.ui.neuroiris import BACKEND_LABELS, VIEW_LABELS, ImageCanvas, TaskWorker, json_text
+
+
+def add_views(combo: QComboBox, selected: str = "inner_face") -> None:
+    for key, label in VIEW_LABELS.items():
+        combo.addItem(label, key)
+    combo.setCurrentIndex(max(0, combo.findData(selected)))
+
+
+def add_backends(combo: QComboBox, selected: str = "hybrid") -> None:
+    for key, label in BACKEND_LABELS.items():
+        combo.addItem(label, key)
+    combo.setCurrentIndex(max(0, combo.findData(selected)))
+
+
+def spin(value: int, minimum: int, maximum: int) -> QSpinBox:
+    widget = QSpinBox()
+    widget.setRange(minimum, maximum)
+    widget.setValue(value)
+    return widget
+
+
+def decimal(value: float, minimum: float, maximum: float, decimals: int = 3) -> QDoubleSpinBox:
+    widget = QDoubleSpinBox()
+    widget.setDecimals(decimals)
+    widget.setRange(minimum, maximum)
+    widget.setValue(value)
+    return widget
+
+
+def read_image(path: str) -> np.ndarray | None:
+    try:
+        return cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
+    except (OSError, cv2.error):
+        return None
+
+
+def error(parent: QWidget, message: Any) -> None:
+    QMessageBox.warning(parent, "NeuroIris", str(message))
+
+
+def export_json(parent: QWidget, value: Any, filename: str) -> None:
+    path, _ = QFileDialog.getSaveFileName(parent, "Export report", filename, "JSON (*.json)")
+    if path:
+        try:
+            Path(path).write_text(json_text(value), encoding="utf-8")
+        except OSError as exc:
+            error(parent, exc)
+
+
+class WorkDialog(QDialog):
+    """One retained worker thread, with explicit lifetime and real progress."""
+    def __init__(self, service: Any, title: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.service = service
+        self.setWindowTitle(title)
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        self.resize(980, 740)
+        self.busy = False
+        self._thread: QThread | None = None
+        self._worker: TaskWorker | None = None
+        self._locked: list[QWidget] = []
+        self.body = QVBoxLayout(self)
+        self.footer = QLabel("")
+        self.footer.setWordWrap(True)
+        self.progress = QProgressBar()
+        self.progress.hide()
+
+    def finish_layout(self) -> None:
+        self.body.addWidget(self.progress)
+        self.body.addWidget(self.footer)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        self.body.addWidget(buttons)
+
+    def run(self, operation: Callable, done: Callable | None = None) -> None:
+        if self.busy:
+            return
+        self.busy = True
+        for widget in self._locked:
+            widget.setEnabled(False)
+        self.progress.setRange(0, 0)
+        self.progress.show()
+        self.footer.setText("Operation running…")
+        thread = QThread(self)
+        worker = TaskWorker(operation)
+        worker.moveToThread(thread)
+        self._thread, self._worker = thread, worker
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._progress)
+        worker.result.connect(done or (lambda result: self.footer.setText("Completed")))
+        worker.failed.connect(self._failed)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._finished)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+
+    def _progress(self, percent: int, message: str) -> None:
+        self.progress.setRange(0, 100)
+        self.progress.setValue(percent)
+        self.footer.setText(message)
+
+    def _failed(self, message: str) -> None:
+        self.footer.setText(message)
+        error(self, message)
+
+    def _finished(self) -> None:
+        self._thread = self._worker = None
+        self.busy = False
+        self.progress.hide()
+        for widget in self._locked:
+            widget.setEnabled(True)
+
+    def reject(self) -> None:
+        if self.busy:
+            self.footer.setText("Wait for the current operation to finish before closing.")
+            return
+        super().reject()
+
+    def closeEvent(self, event: Any) -> None:
+        if self.busy:
+            self.footer.setText("Wait for the current operation to finish before closing.")
+            event.ignore()
+        else:
+            event.accept()
+
+
+class DatasetDialog(WorkDialog):
+    def __init__(self, service: Any, parent: QWidget | None = None):
+        super().__init__(service, "Dataset Manager · physical-part provenance", parent)
+        intro = QLabel("Assign the same physical part ID to every capture of one housing. All captures of a part remain in one split. Import images from only the selected physical part in each batch.")
+        intro.setWordWrap(True)
+        self.body.addWidget(intro)
+        fields = QGridLayout()
+        self.view = QComboBox()
+        add_views(self.view)
+        self.label = QComboBox()
+        self.label.addItems(["GOOD", "NG"])
+        self.part_id = QLineEdit()
+        self.part_id.setPlaceholderText("Required physical part ID")
+        self.session_id = QLineEdit()
+        self.session_id.setPlaceholderText("Optional batch / capture session")
+        for index, (label, widget) in enumerate([("View", self.view), ("Label", self.label), ("Physical part", self.part_id), ("Capture session", self.session_id)]):
+            fields.addWidget(QLabel(label), 0, index)
+            fields.addWidget(widget, 1, index)
+        self.body.addLayout(fields)
+        buttons = QHBoxLayout()
+        self.import_button = QPushButton("Import Images…")
+        self.import_button.clicked.connect(self.import_images)
+        self.capture_button = QPushButton("Capture Latest Camera Frame")
+        self.capture_button.clicked.connect(self.capture_image)
+        self.remove_button = QPushButton("Reject Selected Sample")
+        self.remove_button.clicked.connect(self.remove_selected)
+        self.refresh_button = QPushButton("Refresh")
+        self.refresh_button.clicked.connect(self.refresh)
+        for button in [self.import_button, self.capture_button, self.remove_button, self.refresh_button]:
+            buttons.addWidget(button)
+        self.body.addLayout(buttons)
+        self._locked = [self.import_button, self.capture_button, self.remove_button, self.refresh_button, self.view, self.label, self.part_id, self.session_id]
+        split = QSplitter(Qt.Orientation.Horizontal)
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Part ID", "View", "Label", "Sample", "Capture session"])
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table.itemSelectionChanged.connect(self.review_selected)
+        split.addWidget(self.table)
+        self.preview = ImageCanvas("Select a saved sample to review")
+        split.addWidget(self.preview)
+        self.body.addWidget(split, 1)
+        self.statistics = QPlainTextEdit()
+        self.statistics.setReadOnly(True)
+        self.statistics.setMaximumHeight(145)
+        self.body.addWidget(self.statistics)
+        self.finish_layout()
+        self._samples: list[dict[str, Any]] = []
+        self.refresh()
+
+    def _identity(self) -> tuple[str, str, str, str] | None:
+        identity = self.part_id.text().strip()
+        if not identity:
+            error(self, "A physical part ID is required. Do not reuse one ID for different housings.")
+            return None
+        return str(self.view.currentData()), self.label.currentText(), identity, self.session_id.text().strip()
+
+    def _inventory(self) -> dict:
+        return {"samples": self.service.samples(), "statistics": self.service.dataset_stats()}
+
+    def refresh(self) -> None:
+        self.run(lambda progress: self._inventory(), self._apply_inventory)
+
+    def _apply_inventory(self, inventory: dict) -> None:
+        self._samples = inventory["samples"]
+        self.table.setRowCount(len(self._samples))
+        for row, sample in enumerate(self._samples):
+            label = sample.get("label", "")
+            label = "GOOD" if label in (0, "GOOD", "good") else "NG" if label in (1, "NG", "ng") else str(label)
+            metadata = sample.get("metadata", {})
+            cells = [sample.get("part_id", ""), VIEW_LABELS.get(sample.get("view", ""), sample.get("view", "")), label,
+                     Path(str(sample.get("path", ""))).name, sample.get("session_id", metadata.get("session_id", ""))]
+            for column, value in enumerate(cells):
+                self.table.setItem(row, column, QTableWidgetItem(str(value)))
+        self.statistics.setPlainText(json_text(inventory["statistics"]))
+        self.footer.setText(f"{len(self._samples)} valid saved samples · rejected samples are excluded from training.")
+
+    def import_images(self) -> None:
+        identity = self._identity()
+        if identity is None:
+            return
+        files, _ = QFileDialog.getOpenFileNames(self, "Import captures of the selected physical part", "", "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)")
+        if not files:
+            return
+        def operation(progress: Callable) -> dict:
+            imported, failures = [], []
+            for index, path in enumerate(files):
+                try:
+                    imported.append(self.service.import_sample(path, *identity))
+                except Exception as exc:
+                    failures.append(f"{Path(path).name}: {exc}")
+                progress(int(100 * (index + 1) / len(files)), f"Imported {index + 1}/{len(files)}")
+            return {"imported": imported, "failures": failures, "inventory": self._inventory()}
+        def done(result: dict) -> None:
+            self._apply_inventory(result["inventory"])
+            self.footer.setText(f"Saved {len(result['imported'])} samples. {len(result['failures'])} rejected imports.")
+            warnings = [str(row.get("warnings", row.get("warning", ""))) for row in result["imported"] if row.get("warnings") or row.get("warning")]
+            if result["failures"] or warnings:
+                QMessageBox.information(self, "Dataset integrity results", "\n".join(result["failures"] + warnings))
+        self.run(operation, done)
+
+    def capture_image(self) -> None:
+        identity = self._identity()
+        if identity is None:
+            return
+        try:
+            packet = self.service.preview()
+            if packet is None or not isinstance(packet.get("image"), np.ndarray):
+                raise ValueError("No live camera frame. Start acquisition on the dashboard first.")
+            image = packet["image"].copy()
+        except Exception as exc:
+            error(self, exc)
+            return
+        def operation(progress: Callable) -> dict:
+            result = self.service.capture_sample(image, *identity)
+            return {"sample": result, "inventory": self._inventory()}
+        self.run(operation, self._capture_done)
+
+    def _capture_done(self, result: dict) -> None:
+        self._apply_inventory(result["inventory"])
+        sample = result["sample"]
+        self.footer.setText("Camera sample saved. " + str(sample.get("warnings", sample.get("warning", ""))))
+
+    def review_selected(self) -> None:
+        index = self.table.currentRow()
+        if 0 <= index < len(self._samples):
+            self.preview.set_image(read_image(str(self._samples[index].get("path", ""))))
+
+    def remove_selected(self) -> None:
+        index = self.table.currentRow()
+        if not 0 <= index < len(self._samples):
+            return
+        sample = self._samples[index]
+        def operation(progress: Callable) -> dict:
+            self.service.remove_sample(str(sample["id"]))
+            return self._inventory()
+        def done(inventory: dict) -> None:
+            self.preview.set_image(None)
+            self._apply_inventory(inventory)
+        self.run(operation, done)
+
+
+class TrainingDialog(WorkDialog):
+    def __init__(self, service: Any, parent: QWidget | None = None, evaluate: bool = False):
+        super().__init__(service, "Evaluate Model · blind held-out parts" if evaluate else "Train Model · view-specific learning", parent)
+        self.evaluate = evaluate
+        self.report: dict[str, Any] = {}
+        settings = service.config.get("models", {})
+        form = QFormLayout()
+        product = service.config.get("product", "Aluminium LED housing")
+        self.product = QLabel(str(product.get("name", "Aluminium LED housing") if isinstance(product, dict) else product))
+        form.addRow("Product", self.product)
+        self.view = QComboBox()
+        add_views(self.view)
+        if evaluate:
+            self.view.insertItem(0, "All required views · final part verdict", "all")
+            self.view.setCurrentIndex(0)
+        form.addRow("Housing face", self.view)
+        self.backend = QComboBox()
+        add_backends(self.backend, settings.get("backend", "hybrid"))
+        form.addRow("Inspection backend", self.backend)
+        neural = settings.get("efficientad", {})
+        self.steps = spin(int(neural.get("max_steps", 10000)), 1, 1000000)
+        self.batch = spin(int(neural.get("inference_batch_size", 2)), 1, 64)
+        self.input_size = spin(int(neural.get("input_size", 512)), 64, 2048)
+        self.imagenet = QLineEdit(str(neural.get("imagenet_dir") or "artifacts/pretrained/imagenette2/train"))
+        self.teacher_cache = QLineEdit(str(neural.get("teacher_cache", "artifacts/pretrained/efficientad")))
+        self.download_teacher = QCheckBox("Allow official checksum-verified teacher download (~40 MB)")
+        self.download_teacher.setChecked(bool(neural.get("allow_download", False)))
+        self.download_imagenette = QCheckBox("Download official Imagenette if missing (~1.5 GB)")
+        self.download_imagenette.setChecked(bool(neural.get("download_imagenette", False)))
+        self.learning_rate = decimal(float(neural.get("learning_rate", .0001)), .000001, .1, 6)
+        self.tile = spin(int(service.config.get("tiling", {}).get("tile_size", 512)), 64, 4096)
+        self.overlap = decimal(float(service.config.get("tiling", {}).get("overlap", .25)), 0, .75, 2)
+        ratios = service.config.get("dataset", {}).get("split", [.7, .15, .15])
+        self.validation = decimal(float(ratios[1]), .05, .45, 2)
+        self.test_fraction = decimal(float(ratios[2]), .05, .45, 2)
+        self.group_sessions = QCheckBox("Keep each capture session / batch in one partition")
+        self.group_sessions.setChecked(bool(service.config.get("dataset", {}).get("group_sessions", False)))
+        if not evaluate:
+            form.addRow("EfficientAD optimizer steps", self.steps)
+            form.addRow("Training batch", QLabel("1 (required by EfficientAD)"))
+            form.addRow("Neural inference batch", self.batch)
+            form.addRow("Neural input edge (px)", self.input_size)
+            form.addRow("Genuine ImageNet / Imagenette directory", self.imagenet)
+            form.addRow("Teacher cache directory", self.teacher_cache)
+            form.addRow(self.download_teacher)
+            form.addRow(self.download_imagenette)
+            form.addRow("Learning rate", self.learning_rate)
+            form.addRow("Tile edge (native pixels)", self.tile)
+            form.addRow("Tile overlap fraction", self.overlap)
+            form.addRow("Validation part fraction", self.validation)
+            form.addRow("Untouched test part fraction", self.test_fraction)
+            form.addRow(self.group_sessions)
+        setup = QWidget()
+        setup.setLayout(form)
+        setup_scroll = QScrollArea()
+        setup_scroll.setWidgetResizable(True)
+        setup_scroll.setWidget(setup)
+        setup_scroll.setMinimumHeight(200)
+        setup_scroll.setMaximumHeight(400)
+        self.body.addWidget(setup_scroll)
+        description = QLabel("Evaluation uses the same inference and decision pipeline on held-out physical parts. RECHECK remains in the report. No accuracy is reported before a real evaluation." if evaluate else "Training and reference selection use only training parts. Thresholds use validation parts. Untouched test parts stay separate. GOOD-only training is supported; sensitivity remains unvalidated without independent NG parts.")
+        description.setWordWrap(True)
+        self.body.addWidget(description)
+        self.stats = QPlainTextEdit()
+        self.stats.setReadOnly(True)
+        self.stats.setMaximumHeight(135)
+        self.body.addWidget(self.stats)
+        self.output = QTextEdit()
+        self.output.setReadOnly(True)
+        self.body.addWidget(self.output, 1)
+        row = QHBoxLayout()
+        self.start = QPushButton("Evaluate Held-out Parts" if evaluate else "Train & Save Versioned Model")
+        self.start.setObjectName("primary")
+        self.start.clicked.connect(self.start_job)
+        row.addWidget(self.start)
+        self.benchmark_button = None
+        if evaluate:
+            self.benchmark_button = QPushButton("Benchmark Saved Models")
+            self.benchmark_button.clicked.connect(self.start_benchmark)
+            row.addWidget(self.benchmark_button)
+            repeated = QPushButton("Repeated Sessions…")
+            repeated.clicked.connect(lambda: RepeatabilityDialog(service, self).exec())
+            row.addWidget(repeated)
+        self.export = QPushButton("Export Report…")
+        self.export.setEnabled(False)
+        self.export.clicked.connect(lambda: export_json(self, self.report, "neuroiris-evaluation.json" if self.evaluate else "neuroiris-training.json"))
+        row.addWidget(self.export)
+        self.body.addLayout(row)
+        self._locked = [self.start, self.view, self.backend, self.steps, self.batch, self.input_size, self.imagenet, self.teacher_cache, self.download_teacher, self.download_imagenette, self.learning_rate,
+                        self.tile, self.overlap, self.validation, self.test_fraction, self.group_sessions]
+        if self.benchmark_button is not None:
+            self._locked.append(self.benchmark_button)
+        self._training_controls = [self.steps, self.batch, self.input_size, self.imagenet, self.teacher_cache,
+            self.download_teacher, self.download_imagenette, self.learning_rate, self.tile, self.overlap,
+            self.validation, self.test_fraction, self.group_sessions]
+        self.finish_layout()
+        self._apply_technician_restrictions()
+        self.view.currentIndexChanged.connect(self.refresh)
+        self.refresh()
+
+    def refresh(self) -> None:
+        try:
+            self.stats.setPlainText(json_text(self.service.dataset_stats()))
+        except Exception as exc:
+            self.stats.setPlainText(str(exc))
+
+    def _progress(self, percent: int, message: str) -> None:
+        super()._progress(percent, message)
+        if message:
+            self.output.append(message)
+
+    def start_job(self) -> None:
+        view, backend = str(self.view.currentData()), str(self.backend.currentData())
+        if not self.evaluate and self._can_edit_settings():
+            if self.validation.value() + self.test_fraction.value() >= .8:
+                error(self, "Keep sufficient physical parts for training. Validation plus test fractions must be below 0.8.")
+                return
+            try:
+                self.service.configure({"models": {"efficientad": {"max_steps": self.steps.value(), "train_batch_size": 1, "inference_batch_size": self.batch.value(), "input_size": self.input_size.value(), "learning_rate": self.learning_rate.value(), "imagenet_dir": self.imagenet.text().strip(), "teacher_cache": self.teacher_cache.text().strip(), "allow_download": self.download_teacher.isChecked(), "download_imagenette": self.download_imagenette.isChecked()}},
+                    "tiling": {"tile_size": self.tile.value(), "overlap": self.overlap.value()},
+                    "dataset": {"split": [1 - self.validation.value() - self.test_fraction.value(), self.validation.value(), self.test_fraction.value()], "group_sessions": self.group_sessions.isChecked()}})
+            except Exception as exc:
+                error(self, exc)
+                return
+        self.output.clear()
+        self.export.setEnabled(False)
+        operation = self.service.evaluate if self.evaluate else self.service.train
+        self.run(lambda progress: operation(view, backend, progress), self.completed)
+
+    def _can_edit_settings(self) -> bool:
+        return (not hasattr(self.service, "technician_configured") or
+                bool(getattr(self.service, "technician_unlocked", False)))
+
+    def _apply_technician_restrictions(self) -> None:
+        allowed = self._can_edit_settings()
+        for control in self._training_controls:
+            control.setEnabled(allowed and not self.busy)
+        if not allowed and not self.evaluate:
+            self.footer.setText("Operator mode: training uses saved settings. Unlock Technician Access on the dashboard to change commissioning settings.")
+
+    def _finished(self) -> None:
+        super()._finished()
+        self._apply_technician_restrictions()
+
+    def start_benchmark(self) -> None:
+        if not hasattr(self.service, "benchmark"):
+            error(self, "This service has no saved-model benchmark adapter.")
+            return
+        self.output.clear()
+        self.export.setEnabled(False)
+        view = str(self.view.currentData())
+        self.run(lambda progress: self.service.benchmark(view, progress), self.completed)
+
+    def completed(self, report: dict) -> None:
+        self.report = report
+        self.output.append(json_text(report))
+        self.export.setEnabled(True)
+        self.footer.setText("Evaluation completed. Review sample counts, coverage and false rejects before selecting this model." if self.evaluate else "Training completed and model artifacts saved. Review independent validation before using this model.")
+
+
+class CameraDialog(WorkDialog):
+    def __init__(self, service: Any, parent: QWidget | None = None):
+        super().__init__(service, "Camera Settings · selected device only", parent)
+        self.resize(800, 700)
+        settings = service.config.get("camera", {})
+        form = QFormLayout()
+        self.index = spin(int(settings.get("index", 0)), 0, 64)
+        self.backend = QComboBox()
+        for name in ["auto", "dshow", "msmf", "v4l2", "any"]:
+            self.backend.addItem(name, name)
+        self.backend.setCurrentIndex(max(0, self.backend.findData(settings.get("backend", "auto"))))
+        self.width = spin(int(settings.get("width", 3840)), 160, 16384)
+        self.height = spin(int(settings.get("height", 2160)), 120, 16384)
+        self.fps = decimal(float(settings.get("fps", 30)), 1, 240, 1)
+        for name, widget in [("Camera index", self.index), ("Capture backend", self.backend), ("Requested width (px)", self.width), ("Requested height (px)", self.height), ("Requested FPS", self.fps)]:
+            form.addRow(name, widget)
+        self.body.addLayout(form)
+        note = QLabel("MJPEG is requested before 4K negotiation. Requested settings are preferences; the live diagnostics below show the actual format. Device index never falls back to a different camera.")
+        note.setWordWrap(True)
+        self.body.addWidget(note)
+        self.apply = QPushButton("Save & Reconnect Selected Camera")
+        self.apply.clicked.connect(self.connect_camera)
+        self.body.addWidget(self.apply)
+        controls = QGroupBox("Driver controls · raw backend units")
+        control_layout = QFormLayout(controls)
+        self._unsupported_controls: set[str] = set()
+        self.control = QComboBox()
+        for name in ["exposure", "auto_exposure", "gain", "brightness", "focus", "autofocus", "white_balance", "auto_white_balance"]:
+            self.control.addItem(name.replace("_", " ").title(), name)
+        self.value = decimal(0, -100000, 100000, 3)
+        self.apply_control = QPushButton("Apply & Verify Readback")
+        self.apply_control.clicked.connect(self.set_control)
+        control_layout.addRow("Control", self.control)
+        control_layout.addRow("Raw device value", self.value)
+        control_layout.addRow(self.apply_control)
+        self.control_note = QLabel("Control support is confirmed only after the driver accepts a value and verifies readback. Auto-exposure encodings depend on the backend. Use the device documentation.")
+        self.control_note.setWordWrap(True)
+        control_layout.addRow(self.control_note)
+        self.body.addWidget(controls)
+        self.control.currentIndexChanged.connect(lambda: self.refresh())
+        self.diagnostics = QPlainTextEdit()
+        self.diagnostics.setReadOnly(True)
+        self.body.addWidget(self.diagnostics, 1)
+        self._locked = [self.apply, self.index, self.backend, self.width, self.height, self.fps, self.apply_control]
+        self.finish_layout()
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(1000)
+        self.refresh()
+
+    def refresh(self) -> None:
+        try:
+            data = self.service.diagnostics()
+            camera = data.get("camera", data.get("capture", {}))
+            self.diagnostics.setPlainText(json_text(camera))
+            if not self.busy:
+                supported = hasattr(self.service, "set_camera_control")
+                available = supported and bool(camera.get("connected")) and self.control.currentData() not in self._unsupported_controls
+                self.apply_control.setEnabled(available)
+                self.value.setEnabled(available)
+                if not supported:
+                    self.control_note.setText("Camera driver control API is unavailable in this provider.")
+        except Exception as exc:
+            self.diagnostics.setPlainText(str(exc))
+
+    def _finished(self) -> None:
+        super()._finished()
+        self.refresh()
+
+    def connect_camera(self) -> None:
+        settings = {"index": self.index.value(), "backend": self.backend.currentData(),
+                    "width": self.width.value(), "height": self.height.value(), "fps": self.fps.value()}
+        def operation(progress: Callable) -> None:
+            self.service.configure({"camera": settings})
+            self._unsupported_controls.clear()
+            self.service.stop_camera()
+            self.service.start_camera(**settings)
+        def done(_: Any) -> None:
+            parent = self.parent()
+            if hasattr(parent, "camera_running"):
+                parent.camera_running = True
+                parent.resume_preview()
+            self.footer.setText("Acquisition started. Verify actual resolution, MJPEG format and throughput in diagnostics.")
+            self.refresh()
+        self.run(operation, done)
+
+    def set_control(self) -> None:
+        name, value = str(self.control.currentData()), self.value.value()
+        def done(verified: bool) -> None:
+            self.control_note.setText("Driver accepted the control and verified readback." if verified else "Control unavailable for this device/backend/value: driver rejected it or readback did not match. Inspect diagnostics and device documentation.")
+            if not verified:
+                self._unsupported_controls.add(name)
+                self.apply_control.setEnabled(False)
+                self.value.setEnabled(False)
+            self.refresh()
+        self.run(lambda progress: self.service.set_camera_control(name, value), done)
+
+
+class ModelSettingsDialog(QDialog):
+    def __init__(self, service: Any, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.service = service
+        self.setWindowTitle("Model Settings · saved view-specific versions")
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        self.resize(900, 640)
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.backend = QComboBox()
+        add_backends(self.backend, service.config.get("models", {}).get("backend", "hybrid"))
+        form.addRow("Active inference mode", self.backend)
+        self.view = QComboBox()
+        add_views(self.view)
+        form.addRow("Model view", self.view)
+        self.models = QComboBox()
+        form.addRow("Saved model version", self.models)
+        layout.addLayout(form)
+        self.metadata = QPlainTextEdit()
+        self.metadata.setReadOnly(True)
+        layout.addWidget(self.metadata, 1)
+        optional = QLabel("Dinomaly benchmark and DINOv2 comparison: unavailable in this release. They are disabled and never substituted for trained neural models.")
+        optional.setWordWrap(True)
+        layout.addWidget(optional)
+        self.side_views = QCheckBox("Require both side views as well as Face A and Face B")
+        self.side_views.setChecked(len(service.config.get("views", {}).get("required", [])) > 2)
+        layout.addWidget(self.side_views)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Close)
+        buttons.accepted.connect(self.save)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._models: list[dict] = []
+        self.view.currentIndexChanged.connect(self.refresh)
+        self.backend.currentIndexChanged.connect(self.refresh)
+        self.models.currentIndexChanged.connect(self.show_metadata)
+        self.refresh()
+
+    def refresh(self) -> None:
+        try:
+            self._models = [model for model in self.service.models() if model.get("view") == self.view.currentData() and model.get("backend") == ("efficientad" if self.backend.currentData() == "hybrid" else self.backend.currentData())]
+            self.models.clear()
+            self.models.addItem("Use currently selected / latest valid model", None)
+            for model in self._models:
+                self.models.addItem(str(model.get("version", model.get("id", "Saved model"))), model)
+            self.show_metadata()
+        except Exception as exc:
+            self.metadata.setPlainText(str(exc))
+
+    def show_metadata(self) -> None:
+        selected = self.models.currentData()
+        self.metadata.setPlainText(json_text(selected) if selected else "Saved model selection is resolved per view. A missing or unvalidated model produces RECHECK; selecting a mode does not fabricate a trained model.")
+
+    def save(self) -> None:
+        try:
+            backend = str(self.backend.currentData())
+            self.service.set_mode(backend)
+            required = ["inner_face", "ribbed_face"] + (["side_left", "side_right"] if self.side_views.isChecked() else [])
+            self.service.configure({"views": {"required": required, "enabled": list(VIEW_LABELS)}})
+            model = self.models.currentData()
+            if model:
+                self.service.select_model(str(self.view.currentData()), str(model["version"]), backend)
+            self.accept()
+        except Exception as exc:
+            error(self, exc)
+
+
+class HistoryDialog(QDialog):
+    def __init__(self, service: Any, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.service = service
+        self.rows: list[dict] = []
+        self.setWindowTitle("Inspection History · one event per finalized part")
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        self.resize(1000, 700)
+        layout = QVBoxLayout(self)
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Physical part", "Verdict", "Time", "Views", "Evidence"])
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.table.itemSelectionChanged.connect(self.selected)
+        layout.addWidget(self.table, 1)
+        self.details = QPlainTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setMaximumHeight(230)
+        layout.addWidget(self.details)
+        actions = QHBoxLayout()
+        refresh = QPushButton("Refresh")
+        refresh.clicked.connect(self.refresh)
+        export = QPushButton("Export History CSV…")
+        export.clicked.connect(self.export_csv)
+        export_record = QPushButton("Export Selected Record JSON…")
+        export_record.clicked.connect(self.export_record)
+        repeated = QPushButton("Repeatability Summary…")
+        repeated.clicked.connect(lambda: RepeatabilityDialog(service, self).exec())
+        for button in [refresh, export, export_record, repeated]:
+            actions.addWidget(button)
+        layout.addLayout(actions)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.refresh()
+
+    def refresh(self) -> None:
+        try:
+            self.rows = list(reversed(self.service.history()))
+            self.table.setRowCount(len(self.rows))
+            for row, record in enumerate(self.rows):
+                values = [record.get("part_id", ""), record.get("verdict", record.get("final_decision", {}).get("verdict", "")), record.get("timestamp", record.get("finished_at", "")),
+                          ", ".join(record.get("views", {}).keys()) if isinstance(record.get("views"), dict) else str(record.get("views", "")),
+                          record.get("evidence_path", record.get("path", ""))]
+                for column, value in enumerate(values):
+                    self.table.setItem(row, column, QTableWidgetItem(str(value)))
+        except Exception as exc:
+            error(self, exc)
+
+    def selected(self) -> None:
+        index = self.table.currentRow()
+        self.details.setPlainText(json_text(self.rows[index]) if 0 <= index < len(self.rows) else "")
+
+    def export_csv(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Export finalized part history", "neuroiris-history.csv", "CSV (*.csv)")
+        if path:
+            try:
+                with Path(path).open("w", newline="", encoding="utf-8-sig") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=["part_id", "verdict", "timestamp", "reasons", "missing_views", "record"])
+                    writer.writeheader()
+                    for row in self.rows:
+                        writer.writerow({"part_id": row.get("part_id"), "verdict": row.get("verdict"), "timestamp": row.get("timestamp", row.get("finished_at", "")),
+                                         "reasons": json_text(row.get("reasons", [])), "missing_views": json_text(row.get("missing_views", [])), "record": json_text(row)})
+            except OSError as exc:
+                error(self, exc)
+
+    def export_record(self) -> None:
+        index = self.table.currentRow()
+        if 0 <= index < len(self.rows):
+            export_json(self, self.rows[index], "neuroiris-inspection.json")
+
+
+def repeatability_summary(records: list[dict]) -> dict:
+    """Summarize verified repeated sessions without treating consistency as accuracy."""
+    grouped: dict[str, list[dict]] = {}
+    seen = set()
+    for record in records:
+        if not record.get("counted") or not record.get("integrity_verified"):
+            continue
+        event = record.get("event_id")
+        if event and event in seen:
+            continue
+        if event:
+            seen.add(event)
+        part = str(record.get("part_id", "")).strip()
+        if part:
+            grouped.setdefault(part, []).append(record)
+    groups = []
+    for part, sessions in sorted(grouped.items()):
+        if len(sessions) < 2:
+            continue
+        counts = {"PASS": 0, "FAIL": 0, "RECHECK": 0}
+        versions = set()
+        required = set()
+        for session in sessions:
+            verdict = session.get("verdict", (session.get("final_decision") or {}).get("verdict", "RECHECK"))
+            if verdict in counts:
+                counts[verdict] += 1
+            versions.add(tuple(sorted((view, str(decision.get("model_version") or "unrecorded"))
+                                     for view, decision in session.get("views", {}).items())))
+            required.add(tuple(sorted(session.get("required_views", []))))
+        groups.append({"part_id": part, "sessions": len(sessions), "verdict_counts": counts,
+                       "consistent_verdict": sum(value > 0 for value in counts.values()) == 1,
+                       "same_recorded_models_and_coverage": (len(versions) == 1 and len(required) == 1
+                           and all(signature and all(version != "unrecorded" for _, version in signature) for signature in versions)),
+                       "model_signatures": [list(signature) for signature in sorted(versions)],
+                       "event_ids": [session.get("event_id") for session in sessions]})
+    return {"scope": "Recorded repeated inspection sessions of the same physical part ID",
+            "limitations": ["Operator must use the same physical housing and reposition it between sessions.",
+                            "History does not verify physical repositioning or defect ground truth.",
+                            "Consistent decisions are not a measure of defect detection accuracy.",
+                            "Model and coverage changes must be reviewed before comparing sessions."],
+            "independent_part_ids": len(grouped), "repeated_part_ids": len(groups),
+            "repeated_sessions": sum(group["sessions"] for group in groups),
+            "parts_with_mixed_verdicts": sum(not group["consistent_verdict"] for group in groups),
+            "groups": groups}
+
+
+class RepeatabilityDialog(WorkDialog):
+    def __init__(self, service: Any, parent: QWidget | None = None):
+        super().__init__(service, "Repeatability · recorded physical-part sessions", parent)
+        self.report: dict = {}
+        instruction = QLabel("To collect repeated placements, finalize the first inspection, physically remove and reposition the same housing, then start a new session with the same part ID. Capture every required view again. Use the same models and settings. This report counts verified stored sessions; it does not measure detection accuracy.")
+        instruction.setWordWrap(True)
+        self.body.addWidget(instruction)
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["Physical part", "Sessions", "PASS", "FAIL", "RECHECK", "Verdicts", "Model / coverage"])
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self.body.addWidget(self.table, 1)
+        self.details = QPlainTextEdit()
+        self.details.setReadOnly(True)
+        self.details.setMaximumHeight(220)
+        self.body.addWidget(self.details)
+        actions = QHBoxLayout()
+        self.refresh_button = QPushButton("Refresh Verified Sessions")
+        self.refresh_button.clicked.connect(self.refresh)
+        actions.addWidget(self.refresh_button)
+        self.export_button = QPushButton("Export Summary JSON…")
+        self.export_button.setEnabled(False)
+        self.export_button.clicked.connect(lambda: export_json(self, self.report, "neuroiris-repeatability.json"))
+        actions.addWidget(self.export_button)
+        self.body.addLayout(actions)
+        self._locked = [self.refresh_button]
+        self.finish_layout()
+        self.refresh()
+
+    def refresh(self) -> None:
+        self.run(lambda progress: repeatability_summary(self.service.history()), self.completed)
+
+    def completed(self, report: dict) -> None:
+        self.report = report
+        self.table.setRowCount(len(report["groups"]))
+        for row, group in enumerate(report["groups"]):
+            counts = group["verdict_counts"]
+            values = [group["part_id"], group["sessions"], counts["PASS"], counts["FAIL"], counts["RECHECK"],
+                      "Consistent" if group["consistent_verdict"] else "MIXED · review",
+                      "Same recorded models" if group["same_recorded_models_and_coverage"] else "Changed / incomplete"]
+            for column, value in enumerate(values):
+                self.table.setItem(row, column, QTableWidgetItem(str(value)))
+        self.details.setPlainText(json_text(report))
+        self.export_button.setEnabled(True)
+        self.footer.setText(f"{report['repeated_part_ids']} repeated physical part IDs · {report['repeated_sessions']} finalized sessions · {report['parts_with_mixed_verdicts']} parts with mixed verdicts")
+
+
+class TechnicalDialog(QDialog):
+    def __init__(self, service: Any, last_result: dict, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.service = service
+        self.last_result = last_result
+        if hasattr(service, "diagnostic_maps"):
+            last_result = {**last_result, "diagnostic_maps": service.diagnostic_maps()}
+        self.setWindowTitle("Technician · diagnostics and image-unit tolerances")
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        self.resize(1050, 800)
+        layout = QVBoxLayout(self)
+        tabs = QTabWidget()
+        self.diagnostics = QPlainTextEdit()
+        self.diagnostics.setReadOnly(True)
+        tabs.addTab(self.diagnostics, "Hardware & camera")
+        self.result = QPlainTextEdit()
+        self.result.setReadOnly(True)
+        self.result.setPlainText(json_text(last_result))
+        tabs.addTab(self.result, "Last inference details")
+        maps = QWidget()
+        map_layout = QVBoxLayout(maps)
+        self.map_choice = QComboBox()
+        self.map_images: dict[str, np.ndarray] = {}
+        self._find_maps(last_result)
+        for name in self.map_images:
+            self.map_choice.addItem(name)
+        map_layout.addWidget(self.map_choice)
+        self.map_canvas = ImageCanvas("No diagnostic maps available. Inspect a view first.")
+        map_layout.addWidget(self.map_canvas, 1)
+        self.map_choice.currentTextChanged.connect(self.display_map)
+        tabs.addTab(maps, "Maps & registration")
+        settings_widget = QWidget()
+        form = QFormLayout(settings_widget)
+        note = QLabel("Changes apply to subsequent training or inspection. Pixel tolerances are image measurements; no micrometre precision is claimed. Recalibrate and validate thresholds after changing the pipeline.")
+        note.setWordWrap(True)
+        form.addRow(note)
+        self.settings = QPlainTextEdit()
+        editable = {key: service.config.get(key, {}) for key in ["quality", "geometry", "calibration", "tiling"]}
+        self.settings.setPlainText(json_text(editable))
+        form.addRow("Advanced configuration (JSON)", self.settings)
+        self.apply = QPushButton("Validate JSON & Save Overrides")
+        self.apply.clicked.connect(self.save)
+        form.addRow(self.apply)
+        tabs.addTab(settings_widget, "Tolerances & calibration")
+        layout.addWidget(tabs, 1)
+        row = QHBoxLayout()
+        self.refresh_button = QPushButton("Refresh Diagnostics")
+        self.refresh_button.clicked.connect(self.refresh)
+        row.addWidget(self.refresh_button)
+        export = QPushButton("Export Diagnostic Report…")
+        export.clicked.connect(lambda: export_json(self, {"diagnostics": service.diagnostics(), "last_result": last_result}, "neuroiris-diagnostics.json"))
+        row.addWidget(export)
+        layout.addLayout(row)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh)
+        self.timer.start(2000)
+        self.refresh()
+        self.display_map(self.map_choice.currentText())
+
+    def _find_maps(self, data: Any, prefix: str = "") -> None:
+        if isinstance(data, dict):
+            for key, value in data.items():
+                path = f"{prefix}.{key}" if prefix else key
+                if isinstance(value, np.ndarray) and value.ndim in (2, 3) and value.size:
+                    self.map_images[path] = value
+                elif isinstance(value, dict):
+                    self._find_maps(value, path)
+
+    def display_map(self, name: str) -> None:
+        image = self.map_images.get(name)
+        if image is None:
+            return
+        if image.dtype != np.uint8:
+            finite = np.nan_to_num(image)
+            if finite.size and float(finite.max()) > float(finite.min()):
+                image = np.clip((finite - finite.min()) / (finite.max() - finite.min()) * 255, 0, 255).astype(np.uint8)
+            else:
+                image = np.zeros_like(finite, dtype=np.uint8)
+        if image.ndim == 2:
+            image = cv2.applyColorMap(image, cv2.COLORMAP_TURBO)
+        self.map_canvas.set_image(image)
+
+    def refresh(self) -> None:
+        try:
+            self.diagnostics.setPlainText(json_text(self.service.diagnostics()))
+        except Exception as exc:
+            self.diagnostics.setPlainText(str(exc))
+
+    def save(self) -> None:
+        try:
+            settings = json.loads(self.settings.toPlainText())
+            if not isinstance(settings, dict) or any(key not in {"quality", "geometry", "calibration", "tiling"} for key in settings):
+                raise ValueError("Only quality, geometry, calibration and tiling objects may be edited here.")
+            if any(not isinstance(value, dict) for value in settings.values()):
+                raise ValueError("Each configuration section must be a JSON object.")
+            self.service.configure(settings)
+            QMessageBox.information(self, "Configuration saved", "Overrides saved. Validate the affected pipeline before relying on its decisions.")
+        except Exception as exc:
+            error(self, exc)

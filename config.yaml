@@ -1,44 +1,66 @@
+product: aluminium_housing
 paths:
   dataset: ./dataset
   artifacts: ./artifacts
   results: ./inspection_results
   logs: ./logs
+  runtime: ./runtime
+views:
+  required: [inner_face, ribbed_face]
+  enabled: [inner_face, ribbed_face, side_left, side_right]
 camera:
   index: 0
-  probe_count: 5
-  width: 1280
-  height: 720
-image_size: 384
+  width: 3840
+  height: 2160
+  fps: 30
+  backend: auto
+quality:
+  min_sharpness: 35.0
+  min_brightness: 25.0
+  max_brightness: 235.0
+  max_dark_fraction: 0.20
+  max_bright_fraction: 0.15
+  max_motion: 0.025
+models:
+  backend: hybrid
+  efficientad:
+    device: auto
+    max_steps: 10000
+    train_batch_size: 1
+    inference_batch_size: 2
+    learning_rate: 0.0001
+    input_size: 512
+    model_size: small
+    teacher_path: null
+    imagenet_dir: null
+    allow_download: true
+    download_imagenette: false
+    mixed_precision: false
 registration:
-  min_confidence: 0.42
-  ecc_enabled: true
-  foreground_min_area_ratio: 0.06
-golden_bank:
-  max_images: 8
-patchcore:
-  patch_size: 16
-  stride: 8
-  max_memory_patches: 12000
+  min_confidence: 0.55
 geometry:
-  tolerance_multiplier: 4.0
+  rib_inner_radius: 0.33
+  rib_outer_radius: 0.96
+  rib_position_tolerance_px: 2.0
+  rib_contrast_tolerance: 0.055
+  rib_mad_multiplier: 6.0
+  minimum_rib_gap_radius: 0.06
+  rim_tolerance_px: 3.0
+  check_mounting: false
+  mounting_regions: []
+  mounting_edge_tolerance_px: 3.0
+calibration:
+  target_fpr: 0.02
+  recheck_fpr: 0.10
+  critical_recall_target: 0.95
+tiling:
+  tile_size: 512
+  overlap: 0.25
+  batch_size: 4
+  max_training_tiles: 2000
 localization:
-  minimum_defect_area: 90
-  morphology_kernel: 5
-  merge_distance: 12
-temporal:
-  window: 5
-  confirmation_count: 3
-  immediate_critical: true
-inspection:
-  presence_area_ratio: 0.06
-  absence_frames: 4
-  save_good_events: false
-  save_ng_events: true
-visual_change:
-  backend: sklearn
-  require_tao: false
-  tao_command: tao
+  minimum_defect_area: 20
+  minimum_defect_width: 2
 runtime:
-  cuda_device: auto
   log_level: INFO
   random_seed: 42

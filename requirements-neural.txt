@@ -1,0 +1,18 @@
+# Optional genuine EfficientAD stack. Install torch/torchvision from the CUDA
+# 12.8 wheel index first on RTX 5070 (scripts/install-neural.ps1).
+# Tested on Python 3.12 Linux CPU; Windows 11 / RTX 5070 execution still requires
+# the actual target machine. Geometry and the HMI do not import these packages.
+numpy==2.2.6
+opencv-python==4.12.0.88
+torch==2.7.1
+torchvision==0.22.1
+anomalib==2.2.0
+lightning==2.5.2
+pytorch-lightning==2.5.2
+torchmetrics==1.8.2
+timm==1.0.19
+kornia==0.8.3
+einops==0.8.2
+# Anomalib imports its optional video package when importing image models.
+# Its vendored CLIP module also imports requests.
+requests==2.32.4
