@@ -60,6 +60,22 @@ Training splits **globally by physical ID across all views**, not by image. Opti
 
 NG data is optional for GOOD-only research training. Without independent NG validation/test parts, missed-defect rate and defect recall remain unknown (`null`), not 0% or 100%. No automatic defect type is assigned to a generic neural anomaly.
 
+## Repair missing or damaged image metadata
+
+If training reports `Invalid provenance metadata ... .jpg.json: Expecting value`, update to the latest `codex/neuroiris-inspection-system` branch and keep your existing `dataset` directory. Do not delete photographs or create empty JSON files to bypass the error.
+
+Open **DATASET MANAGER**. Unregistered images and damaged metadata appear as **Needs Registration** / **Needs Repair**, so they no longer prevent opening the manager. Select the affected images of **one physical housing**, choose the correct view/GOOD or NG label, enter its actual physical part ID and capture session, and click **Register / Repair Selected**. Repeat for different housings with their own real IDs, then train again.
+
+The importer assigns a descriptive, Windows-safe filename from the selected fields plus a unique suffix. It accepts photos already placed in dataset folders and preserves external source photographs. For explicit repairs it archives the damaged metadata before writing a valid replacement; image bytes are preserved. Valid existing image/metadata pairs continue to work and are not renamed on startup. Reimporting identical bytes for the same part/view/label reuses the existing sample without rewriting its session provenance; conflicting labels or physical IDs remain an integrity error.
+
+New metadata is published atomically and flushed to disk, with a separate verified recovery copy. A missing or malformed sidecar can be restored automatically only when that copy matches the original image and its recorded identity. Older broken sidecars without such a copy require the explicit selected-field repair above. Training never silently skips unresolved images or invents physical-part IDs. Renaming photographs does not create independent housings: all pictures of the same housing must retain one part ID.
+
+The same explicit repair is available from PowerShell:
+
+```powershell
+.\.venv\Scripts\python.exe -m src.cli repair ".\dataset\inner_face\GOOD\photo.jpg" --view inner_face --label GOOD --part-id housing17 --session-id placement1
+```
+
 ## Commission the view and train
 
 1. Connect the Makose camera and select its exact index in **CAMERA SETTINGS**. No fallback to another index occurs. Check **actual** decoded resolution, FOURCC and measured capture FPS. A requested 3840×2160 setting alone is insufficient. If the device negotiates a different resolution/format, live analysis returns RECHECK until commissioned correctly.

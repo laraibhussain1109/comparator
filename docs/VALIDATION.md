@@ -26,3 +26,9 @@ Also executed successfully:
 - Windows CPython 3.12 torch/torchvision CUDA 12.8 wheel metadata exists and the torchvision build requires the selected torch build. No Windows/CUDA binary execution was claimed.
 
 Actual device format/FPS, Windows startup, RTX 5070 execution/VRAM, real trained housing behavior and unseen-part/localization accuracy remain subject to [workstation acceptance](ACCEPTANCE.md). The repository's production dataset and active housing model store remain empty. Cached teacher weights are pretrained assets, not a trained housing model. Dinomaly and DINOv2 remain unavailable.
+
+## Dataset import and metadata repair regression validation
+
+The reported missing-sidecar import failure and empty `.jpg.json` training failure were reproduced against the original implementation. The repair update passed the full suite with the genuine EfficientAD command above: **170 passed in 128.00 seconds**, with no skips. After the final Windows file-publication adjustment, **36 import, repair, CLI, UI and training tests passed**, including two additional simulated Windows publication regressions. The actual HMI also passed its offscreen startup smoke test.
+
+The regression fixtures cover external import, selected-field filenames, registration of photographs already inside dataset folders, empty/malformed/BOM metadata, verified recovery copies, repair backups, interrupted writes, destination collisions, duplicate identity conflicts, rejection preservation, and the Dataset Manager repair action through the real service. Repaired synthetic datasets completed geometry training and grouped evaluation; multiple captures of one housing still count as one physical part. No local Windows photographs were available in the cloud environment, and simulated Windows file-publication tests are not Windows workstation acceptance.

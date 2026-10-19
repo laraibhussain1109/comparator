@@ -17,7 +17,7 @@ import numpy as np
 from src.acquisition import CameraConfig, CameraService, QualityChecker, runtime_diagnostics
 from src.artifacts import ArtifactStore, atomic_json, digest, safe_name
 from src.security import TechnicianLock
-from src.data import DatasetStore, Sample, split_by_part
+from src.data import DatasetIntegrityError, DatasetStore, Sample, split_by_part
 from src.evaluation import calibrate_operating_point, evaluate_samples, export_report
 from src.inspection.evidence import EvidenceStore
 from src.inspection.session import InspectionSession, ViewDecision
@@ -96,10 +96,17 @@ class NeuroIrisService:
         return self.dataset.stats()
 
     def samples(self, view=None) -> list[dict]:
-        return [sample.to_dict() for sample in self.dataset.inventory(view)]
+        # A pending registration must not prevent opening Dataset Manager to fix it.
+        return [sample.to_dict() for sample in self.dataset.inventory(view, strict=False)]
+
+    def pending_samples(self, view=None) -> list[dict]:
+        return self.dataset.unmanaged_images(view)
 
     def import_sample(self, path, view, label, part_id, session_id='') -> dict:
         return self.dataset.import_image(path, view, label, part_id, session_id).to_dict()
+
+    def repair_sample(self, path, view, label, part_id, session_id='') -> dict:
+        return self.dataset.repair_image(path, view, label, part_id, session_id).to_dict()
 
     def capture_sample(self, image, view, label, part_id, session_id='') -> dict:
         return self.dataset.capture_image(image, view, label, part_id, session_id).to_dict()
@@ -371,6 +378,16 @@ class NeuroIrisService:
         backend = 'efficientad' if backend == 'hybrid' else backend
         emit = progress or (lambda *_: None)
         emit(0, 'Dataset integrity', 'Checking physical IDs, hashes and global view grouping')
+        pending = self.pending_samples()
+        if pending:
+            names = ', '.join(Path(item['path']).name for item in pending[:3])
+            raise DatasetIntegrityError(
+                f'{len(pending)} dataset image(s) need registration or metadata repair ({names}). '
+                'Open Dataset Manager, select the rows marked Needs Registration or Needs Repair, '
+                'enter their actual physical part ID, view, label and session, then click '
+                'Register / Repair Selected. Process only one physical housing in each batch. '
+                'Your images have been kept; do not delete them or invent IDs from filenames.'
+            )
         samples = self.dataset.inventory()
         split = split_by_part(samples, seed=int(self.config['runtime']['random_seed']),
                               ratios=tuple(self.config.get('dataset', {}).get('split', [.7, .15, .15])),

@@ -1,6 +1,8 @@
 """View-aware image provenance and physical-part grouping.
 
-Source bytes and sidecars are write-once; rejecting a sample adds a tombstone.
+Original bytes and valid provenance remain immutable. Damaged sidecars can be
+restored from a verified mirror or explicitly repaired after preserving a backup.
+Rejecting a sample adds a tombstone.
 A folder name is never used as evidence of an independent physical component.
 """
 from __future__ import annotations
@@ -11,8 +13,10 @@ from pathlib import Path
 from typing import Any, Iterable
 import hashlib
 import json
+import os
 import random
 import re
+import threading
 import uuid
 
 import cv2
@@ -20,6 +24,7 @@ import numpy as np
 
 VIEWS = ("inner_face", "ribbed_face", "side_left", "side_right")
 EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
+_WINDOWS = os.name == "nt"
 
 
 class DatasetIntegrityError(ValueError):
@@ -74,19 +79,258 @@ def _validate_identity(view: str, label: str | int, part_id: str) -> int:
     return 0 if label in ("GOOD", 0) else 1
 
 
+class _MetadataRepairNeeded(DatasetIntegrityError):
+    """Missing identity evidence requires an explicit operator assignment."""
+
+
+def _publish_new(staged: Path, target: Path) -> None:
+    """Publish a complete same-directory file without replacing another file.
+
+    Windows rename refuses an existing destination and works without hard-link
+    support on FAT/exFAT and network shares. POSIX rename would replace a file,
+    so use an exclusive hard link there. Callers clean up remaining staging links.
+    """
+    if _WINDOWS:
+        os.rename(staged, target)
+    else:
+        os.link(staged, target)
+
+
+def _atomic_bytes(path: Path, payload: bytes, *, replace: bool = False) -> None:
+    """Publish only a closed, fsynced file; never expose a partial final JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".metadata-{uuid.uuid4().hex}.tmp")
+    created = False
+    try:
+        with temporary.open("xb") as stream:
+            created = True
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if replace:
+            os.replace(temporary, path)
+            created = False
+        else:
+            _publish_new(temporary, path)
+            temporary.unlink(missing_ok=True)
+            created = False
+        _sync_directory(path.parent)
+    finally:
+        if created:
+            temporary.unlink(missing_ok=True)
+
+
+def _sync_directory(directory: Path) -> None:
+    # Directory fsync is supported on POSIX; Windows cannot open a directory this way.
+    if os.name != "nt":
+        handle = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(handle)
+        finally:
+            os.close(handle)
+
+
+def _json_bytes(value: Any) -> bytes:
+    return json.dumps(value, indent=2, sort_keys=True, allow_nan=False).encode("utf-8")
+
+
+def _slug(value: str, maximum: int, fallback: str) -> str:
+    # Dots are excluded too: Windows interprets CON.anything as a device name.
+    return re.sub(r"[^A-Za-z0-9_-]+", "-", value).strip("-_")[:maximum] or fallback
+
+
 class DatasetStore:
+    _root_locks: dict[str, Any] = {}
+    _root_locks_guard = threading.Lock()
+
     def __init__(self, root: str | Path):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
+        with self._root_locks_guard:
+            self._lock = self._root_locks.setdefault(os.path.normcase(str(self.root)), threading.RLock())
+
+    def _internal(self, path: Path) -> bool:
+        return not path.is_symlink() and path.resolve().is_relative_to(self.root)
+
+    @staticmethod
+    def _sidecar(path: Path) -> Path:
+        return path.with_suffix(path.suffix + ".json")
+
+    def _mirror(self, path: Path) -> Path:
+        relative = path.relative_to(self.root).as_posix()
+        key = hashlib.sha256(relative.encode("utf-8")).hexdigest()
+        mirror = self.root / ".metadata" / (key + ".json")
+        if not mirror.resolve().is_relative_to(self.root) or mirror.is_symlink():
+            raise DatasetIntegrityError("Metadata recovery directory/file uses an unsafe path")
+        return mirror
+
+    def _paths(self):
+        for path in sorted(self.root.glob("*/*/*")):
+            if path.is_file() and path.suffix.lower() in EXTENSIONS and path.parent.name in ("GOOD", "NG") and not path.parent.parent.name.startswith("."):
+                if not self._internal(path):
+                    raise DatasetIntegrityError(f"Dataset image uses an unsafe external/symlink path: {path}")
+                yield path, path.parent.parent.name, path.parent.name
+        for folder in ("GOOD", "NG"):
+            for path in sorted((self.root / folder).glob("*")):
+                if path.is_file() and path.suffix.lower() in EXTENSIONS:
+                    if not self._internal(path):
+                        raise DatasetIntegrityError(f"Dataset image uses an unsafe external/symlink path: {path}")
+                    yield path, None, folder
+
+    def _validate_details(self, details: Any, path: Path, view: str | None,
+                          folder: str, digest: str) -> dict[str, Any]:
+        if not isinstance(details, dict):
+            raise _MetadataRepairNeeded(f"Invalid provenance metadata: {self._sidecar(path)}: expected a JSON object")
+        # Any available contradictory evidence remains fatal, even in an incomplete file.
+        claimed_hash = details.get("sha256")
+        if isinstance(claimed_hash, str) and re.fullmatch(r"[a-f0-9]{64}", claimed_hash) and claimed_hash != digest:
+            raise DatasetIntegrityError(f"Image bytes differ from immutable sidecar: {path}")
+        if view is not None and details.get("view") is not None and details["view"] != view:
+            raise DatasetIntegrityError(f"Image view differs from immutable sidecar: {path}")
+        label = details.get("label")
+        if label in (0, 1, "GOOD", "NG") and (0 if label in (0, "GOOD") else 1) != (0 if folder == "GOOD" else 1):
+            raise DatasetIntegrityError(f"Image label differs from immutable sidecar: {path}")
+        if details.get("schema_version", 1) != 1:
+            raise DatasetIntegrityError(f"Unsupported provenance schema: {path}")
+        required = ("schema_version", "id", "view", "label", "part_id", "sha256")
+        if any(key not in details for key in required):
+            raise _MetadataRepairNeeded(f"Invalid provenance metadata: {self._sidecar(path)}: missing required identity fields; repair with explicit physical part ID")
+        try:
+            numeric = _validate_identity(details["view"], details["label"], details["part_id"])
+        except (TypeError, ValueError) as exc:
+            raise _MetadataRepairNeeded(f"Invalid provenance metadata: {self._sidecar(path)}: {exc}") from exc
+        if numeric != details["label"] or not isinstance(details["id"], str) or not re.fullmatch(r"[A-Za-z0-9_-]+", details["id"]):
+            raise _MetadataRepairNeeded(f"Invalid provenance metadata: {self._sidecar(path)}: invalid sample ID or numeric label")
+        if not isinstance(claimed_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", claimed_hash):
+            raise _MetadataRepairNeeded(f"Invalid provenance metadata: {self._sidecar(path)}: invalid source hash")
+        if view is None:
+            raise _MetadataRepairNeeded(f"Legacy image needs explicit view registration: {path}")
+        return details
+
+    def _archive_sidecar(self, path: Path, original: bytes, digest: str,
+                         selection: dict[str, Any] | None = None) -> Path:
+        backup = self.root / ".metadata" / "repairs" / (uuid.uuid4().hex + ".sidecar.bin")
+        if not backup.resolve().is_relative_to(self.root):
+            raise DatasetIntegrityError("Metadata repair backup directory uses an unsafe path")
+        _atomic_bytes(backup, original)
+        _atomic_bytes(backup.with_suffix(".json"), _json_bytes({
+            "schema_version": 1, "original_image": str(path), "image_sha256": digest,
+            "original_sidecar": str(self._sidecar(path)), "sidecar_sha256": _hash(original),
+            "saved_at": datetime.now(timezone.utc).isoformat(), "selection": selection}))
+        return backup
+
+    def _details(self, path: Path, view: str | None, folder: str) -> tuple[dict[str, Any], bytes]:
+        data = path.read_bytes()
+        digest = _hash(data)
+        sidecar = self._sidecar(path)
+        if sidecar.is_symlink():
+            raise DatasetIntegrityError(f"Metadata sidecar uses an unsafe symbolic link: {sidecar}")
+        original = sidecar.read_bytes() if sidecar.exists() else None
+        error = None
+        try:
+            if original is None:
+                raise _MetadataRepairNeeded(f"Missing metadata/physical part ID: {path}. Import using Dataset Manager with explicit IDs.")
+            try:
+                parsed = json.loads(original.decode("utf-8-sig"))
+            except (UnicodeError, json.JSONDecodeError) as exc:
+                raise _MetadataRepairNeeded(f"Invalid provenance metadata: {sidecar}: {exc}; repair with explicit physical part ID") from exc
+            details = self._validate_details(parsed, path, view, folder, digest)
+        except _MetadataRepairNeeded as exc:
+            error = exc
+            details = None
+        mirror = self._mirror(path)
+        if mirror.exists():
+            try:
+                wrapper = json.loads(mirror.read_text(encoding="utf-8-sig"))
+                recovered = wrapper["metadata"]
+                if (wrapper["schema_version"] != 1 or wrapper["relative_path"] != path.relative_to(self.root).as_posix()
+                        or wrapper["image_sha256"] != digest or wrapper["metadata_sha256"] != _hash(_json_bytes(recovered))):
+                    raise ValueError("recovery mirror path, image hash or metadata checksum mismatch")
+                recovered = self._validate_details(recovered, path, view, folder, digest)
+            except (KeyError, TypeError, ValueError, UnicodeError) as exc:
+                raise DatasetIntegrityError(f"Untrusted/corrupt metadata recovery mirror: {mirror}: {exc}") from exc
+            if details is None:
+                if original is not None:
+                    self._archive_sidecar(path, original, digest)
+                _atomic_bytes(sidecar, _json_bytes(recovered), replace=original is not None)
+                details = recovered
+            elif _json_bytes(details) != _json_bytes(recovered):
+                raise DatasetIntegrityError(f"Provenance identity differs from immutable metadata recovery mirror: {path}")
+        if details is None:
+            raise error
+        _decode(data, str(path))
+        return details, data
 
     def import_image(self, path: str | Path, view: str, label: str | int,
                      part_id: str, session_id: str = "", *,
                      metadata: dict[str, Any] | None = None) -> Sample:
-        source = Path(path)
+        source = Path(path).absolute()
+        if source.is_symlink():
+            raise DatasetIntegrityError("Select an original image, not a symbolic link")
         if source.suffix.lower() not in EXTENSIONS:
             raise ValueError(f"Unsupported image extension: {source.suffix}")
-        return self._store(source.read_bytes(), source.suffix.lower(), view, label,
-                           part_id, session_id, str(source.resolve()), metadata)
+        _validate_identity(view, label, part_id)
+        with self._lock:
+            if self._internal(source) and self._sidecar(source).exists():
+                candidate_view = source.parent.parent.name if source.parent.name in ("GOOD", "NG") and source.parent.parent != self.root else None
+                folder = source.parent.name if source.parent.name in ("GOOD", "NG") else ("GOOD" if label in (0, "GOOD") else "NG")
+                try:
+                    self._details(source, candidate_view, folder)
+                except _MetadataRepairNeeded:
+                    return self.repair_image(source, view, label, part_id, session_id, metadata=metadata)
+            return self._store(source.read_bytes(), source.suffix.lower(), view, label,
+                               part_id, session_id, str(source.resolve()), metadata, source_path=source)
+
+    def repair_image(self, path: str | Path, view: str, label: str | int,
+                     part_id: str, session_id: str = "", *,
+                     metadata: dict[str, Any] | None = None) -> Sample:
+        source = Path(path).absolute()
+        numeric = _validate_identity(view, label, part_id)
+        if not self._internal(source) or source.suffix.lower() not in EXTENSIONS:
+            raise DatasetIntegrityError("Metadata repair requires an original image inside this dataset")
+        with self._lock:
+            sidecar = self._sidecar(source)
+            if not sidecar.exists():
+                return self.import_image(source, view, label, part_id, session_id, metadata=metadata)
+            candidate_view = source.parent.parent.name if source.parent.name in ("GOOD", "NG") and source.parent.parent != self.root else None
+            folder = source.parent.name if source.parent.name in ("GOOD", "NG") else ("GOOD" if numeric == 0 else "NG")
+            try:
+                self._details(source, candidate_view, folder)
+            except _MetadataRepairNeeded:
+                pass
+            else:
+                # Intact or safely recovered records cannot be relabelled by repair.
+                return self._store(source.read_bytes(), source.suffix.lower(), view, label,
+                                   part_id, session_id, str(source.resolve()), metadata, source_path=source)
+            data = source.read_bytes()
+            _decode(data, str(source))
+            broken = sidecar.read_bytes()
+            selection = {"view": view, "label": numeric, "part_id": part_id.strip(), "session_id": str(session_id)}
+            self._check_partial_identity(broken, selection)
+            backup = self._archive_sidecar(source, broken, _hash(data), selection)
+            extra = {**(metadata or {}), "repaired_from": str(source),
+                     "metadata_repair_backup": str(backup.relative_to(self.root))}
+            return self._store(data, source.suffix.lower(), view, label, part_id, session_id,
+                               str(source.resolve()), extra, source_path=source,
+                               repair_sidecar_sha256=_hash(broken))
+
+    @staticmethod
+    def _check_partial_identity(payload: bytes, selection: dict[str, Any]) -> None:
+        """Incomplete JSON can still contain evidence that must not be relabelled."""
+        try:
+            details = json.loads(payload.decode("utf-8-sig"))
+        except (UnicodeError, json.JSONDecodeError):
+            return
+        if not isinstance(details, dict):
+            return
+        for field in ("part_id", "view", "label"):
+            value = details.get(field)
+            if field == "label" and value in ("GOOD", "NG"):
+                value = 0 if value == "GOOD" else 1
+            if field == "part_id" and isinstance(value, str):
+                value = value.strip()
+            if value is not None and value != selection[field]:
+                raise DatasetIntegrityError(f"Existing metadata {field} conflicts with the selected identity; explicit repair cannot relabel known evidence")
 
     def capture_image(self, image: np.ndarray, view: str, label: str | int,
                       part_id: str, session_id: str = "", *,
@@ -99,130 +343,207 @@ class DatasetStore:
         return self._store(encoded.tobytes(), ".png", view, label, part_id,
                            session_id, "camera", metadata)
 
+    def _finish_source(self, source: Path | None, sample: Sample, digest: str,
+                       repair_sidecar_sha256: str | None) -> None:
+        if source is None or not self._internal(source) or source.resolve() == sample.path.resolve():
+            return
+        sidecar = self._sidecar(source)
+        if sidecar.exists() and repair_sidecar_sha256 is None:
+            return  # A managed source record is never removed during ordinary import.
+        try:
+            if not source.is_file() or _hash(source.read_bytes()) != digest:
+                raise DatasetIntegrityError("Selected source changed during registration")
+            if repair_sidecar_sha256 is not None:
+                if not sidecar.exists() or _hash(sidecar.read_bytes()) != repair_sidecar_sha256:
+                    raise DatasetIntegrityError("Selected source metadata changed during repair")
+            elif sidecar.exists():
+                raise DatasetIntegrityError("Selected source gained metadata during registration")
+            source.unlink()
+            if repair_sidecar_sha256 is not None:
+                sidecar.unlink()
+        except (OSError, DatasetIntegrityError) as exc:
+            raise DatasetIntegrityError(
+                f"Verified managed copy retained at {sample.path}, but the selected old source could not be cleaned up: {source}: {exc}. Close the file and retry registration; neither copy is overwritten.") from exc
+
     def _store(self, data: bytes, suffix: str, view: str, label: str | int,
                part_id: str, session_id: str, source: str,
-               extra: dict[str, Any] | None) -> Sample:
-        numeric_label = _validate_identity(view, label, part_id)
-        part_id = part_id.strip()
-        image = _decode(data, source)
-        digest = _hash(data)
-        # Scan rejected samples too: a rejected original cannot be relabelled through reimport.
-        for existing in self._scan(include_rejected=True):
-            if existing.sha256 == digest:
-                raise DatasetIntegrityError(f"Exact duplicate of {existing.id} ({existing.part_id}, {existing.view}); original retained")
-        sample_id = uuid.uuid4().hex
-        directory = self.root / view / ("GOOD" if numeric_label == 0 else "NG")
-        directory.mkdir(parents=True, exist_ok=True)
-        target = directory / (sample_id + suffix)
-        details = dict(extra or {})
-        # Reserved provenance fields cannot be overridden by imported user metadata.
-        details.update({"schema_version": 1, "id": sample_id, "view": view,
-                        "label": numeric_label, "part_id": part_id,
-                        "session_id": str(session_id), "sha256": digest,
-                        "perceptual_hash": _phash(image), "source": source,
-                        "imported_at": datetime.now(timezone.utc).isoformat(),
-                        "captured_at": datetime.now(timezone.utc).isoformat() if source == "camera" else None,
-                        "width": int(image.shape[1]), "height": int(image.shape[0])})
-        payload = json.dumps(details, indent=2, sort_keys=True, allow_nan=False)
-        sidecar = target.with_suffix(target.suffix + ".json")
-        try:
-            with target.open("xb") as stream:
-                stream.write(data)
-            with sidecar.open("x", encoding="utf-8") as stream:
-                stream.write(payload)
-        except Exception:
-            # Only this fresh UUID's files may be cleaned up after an incomplete import.
-            target.unlink(missing_ok=True)
-            sidecar.unlink(missing_ok=True)
-            raise
-        return Sample(sample_id, target, numeric_label, view, part_id, digest, details)
-
-    def _scan(self, include_rejected: bool = False, view: str | None = None) -> list[Sample]:
-        samples: list[Sample] = []
-        seen_ids: set[str] = set()
-        hashes: dict[str, Sample] = {}
-        for path in sorted(self.root.glob("*/*/*")):
-            if not path.is_file() or path.suffix.lower() not in EXTENSIONS:
-                continue
-            candidate_view, folder = path.parent.parent.name, path.parent.name
-            if folder not in ("GOOD", "NG"):
-                continue
-            sidecar = path.with_suffix(path.suffix + ".json")
-            if not sidecar.is_file():
-                raise DatasetIntegrityError(f"Missing metadata/physical part ID: {path}. Import using Dataset Manager; never infer part IDs from image names.")
+               extra: dict[str, Any] | None, *, source_path: Path | None = None,
+               repair_sidecar_sha256: str | None = None) -> Sample:
+        with self._lock:
+            numeric_label = _validate_identity(view, label, part_id)
+            part_id = part_id.strip()
+            image = _decode(data, source)
+            digest = _hash(data)
+            for tombstone in (self.root / ".rejected").glob("*.json"):
+                try:
+                    rejection = json.loads(tombstone.read_text(encoding="utf-8-sig"))
+                    if rejection["sha256"] == digest:
+                        raise DatasetIntegrityError("This exact duplicate image was rejected; importing or repairing it cannot silently restore it")
+                except (KeyError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+                    raise DatasetIntegrityError(f"Invalid sample rejection record: {tombstone}") from exc
+            selection = {"part_id": part_id, "view": view, "label": numeric_label}
+            for candidate, candidate_view, folder in self._paths():
+                sidecar = self._sidecar(candidate)
+                if sidecar.exists() and _hash(candidate.read_bytes()) == digest:
+                    # A malformed/incomplete record may not hide contradictory
+                    # identity evidence merely because unrelated imports can proceed.
+                    self._check_partial_identity(sidecar.read_bytes(), selection)
+            for existing in self._scan(include_rejected=True, strict=False):
+                if existing.sha256 == digest:
+                    if (existing.part_id, existing.view, existing.label) != (part_id, view, numeric_label):
+                        raise DatasetIntegrityError(f"Exact duplicate claims conflicting identity/label: {existing.id} ({existing.part_id}, {existing.view}); original retained")
+                    if (self.root / ".rejected" / f"{existing.id}.json").exists():
+                        raise DatasetIntegrityError("This exact image was rejected; importing it cannot silently restore it")
+                    self._finish_source(source_path, existing, digest, repair_sidecar_sha256)
+                    return existing
+            sample_id = uuid.uuid4().hex
+            directory = self.root / view / ("GOOD" if numeric_label == 0 else "NG")
+            if not directory.resolve().is_relative_to(self.root):
+                raise DatasetIntegrityError("Selected dataset view directory uses an unsafe path")
+            directory.mkdir(parents=True, exist_ok=True)
+            name = "_".join((_slug(part_id, 24, "part"), _slug(view, 20, "view"),
+                             "GOOD" if numeric_label == 0 else "NG",
+                             _slug(str(session_id), 16, "no-session"), sample_id[:12]))
+            target = directory / (name + suffix)
+            details = dict(extra or {})
+            details.update({"schema_version": 1, "id": sample_id, "view": view,
+                            "label": numeric_label, "part_id": part_id,
+                            "session_id": str(session_id), "sha256": digest,
+                            "perceptual_hash": _phash(image), "source": source,
+                            "original_filename": source_path.name if source_path is not None else None,
+                            "imported_at": datetime.now(timezone.utc).isoformat(),
+                            "captured_at": datetime.now(timezone.utc).isoformat() if source == "camera" else None,
+                            "width": int(image.shape[1]), "height": int(image.shape[0])})
+            sidecar = self._sidecar(target)
+            mirror = self._mirror(target)
+            created_image = created_sidecar = created_mirror = False
+            staged = directory / (".image-" + uuid.uuid4().hex + ".tmp")
+            created_staged = False
             try:
-                details = json.loads(sidecar.read_text(encoding="utf-8"))
+                if target.exists():
+                    raise FileExistsError(f"Refusing to overwrite existing dataset image: {target}")
+                with staged.open("xb") as stream:
+                    created_staged = True
+                    stream.write(data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                wrapper = {"schema_version": 1, "relative_path": target.relative_to(self.root).as_posix(),
+                           "image_sha256": digest, "metadata_sha256": _hash(_json_bytes(details)),
+                           "metadata": details}
+                _atomic_bytes(mirror, _json_bytes(wrapper))
+                created_mirror = True
+                _atomic_bytes(sidecar, _json_bytes(details))
+                created_sidecar = True
+                # Publish the complete image last. A scanner cannot observe a
+                # new image until both durable metadata copies already exist.
+                _publish_new(staged, target)
+                created_image = True
+                staged.unlink(missing_ok=True)
+                created_staged = False
+                _sync_directory(directory)
+                verified, original = self._details(target, view, "GOOD" if numeric_label == 0 else "NG")
+                if _hash(original) != digest or verified != details:
+                    raise DatasetIntegrityError("Newly written dataset record failed verification")
+            except Exception:
+                # Exclusive-open failures do not grant ownership of pre-existing files.
+                if created_sidecar:
+                    sidecar.unlink(missing_ok=True)
+                if created_mirror:
+                    mirror.unlink(missing_ok=True)
+                if created_image:
+                    target.unlink(missing_ok=True)
+                raise
+            finally:
+                if created_staged:
+                    staged.unlink(missing_ok=True)
+            sample = Sample(sample_id, target, numeric_label, view, part_id, digest, details)
+            self._finish_source(source_path, sample, digest, repair_sidecar_sha256)
+            return sample
+
+    def _scan(self, include_rejected: bool = False, view: str | None = None,
+              strict: bool = True) -> list[Sample]:
+        with self._lock:
+            samples = []
+            seen_ids = set()
+            hashes = {}
+            for path, candidate_view, folder in self._paths():
+                try:
+                    details, data = self._details(path, candidate_view, folder)
+                except _MetadataRepairNeeded:
+                    if strict:
+                        raise
+                    continue
                 sample_id = details["id"]
-                label = _validate_identity(candidate_view, details["label"], details["part_id"])
-                original = path.read_bytes()
-                digest = _hash(original)
-                if label != (0 if folder == "GOOD" else 1) or details["view"] != candidate_view or details["sha256"] != digest:
-                    raise DatasetIntegrityError(f"Image bytes, view or label differ from immutable sidecar: {path}")
-                if not isinstance(sample_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", sample_id):
-                    raise DatasetIntegrityError(f"Invalid sample ID: {path}")
                 if sample_id in seen_ids:
                     raise DatasetIntegrityError(f"Repeated sample ID: {sample_id}")
                 seen_ids.add(sample_id)
-                _decode(original, str(path))
-                sample = Sample(sample_id, path, label, candidate_view, details["part_id"].strip(), digest, details)
-                prior = hashes.get(digest)
-                if prior and (prior.part_id != sample.part_id or prior.label != sample.label or prior.view != sample.view):
+                sample = Sample(sample_id, path, details["label"], candidate_view,
+                                details["part_id"].strip(), _hash(data), details)
+                prior = hashes.get(sample.sha256)
+                if prior and (prior.part_id, prior.label, prior.view) != (sample.part_id, sample.label, sample.view):
                     raise DatasetIntegrityError(f"Duplicate bytes claim incompatible labels/physical parts/views: {prior.path}, {path}")
-                hashes[digest] = sample
-            except (KeyError, TypeError, json.JSONDecodeError) as exc:
-                raise DatasetIntegrityError(f"Invalid provenance metadata: {sidecar}: {exc}") from exc
-            if (include_rejected or not (self.root / ".rejected" / f"{sample_id}.json").exists()) and (view is None or candidate_view == view):
-                samples.append(sample)
-        # Legacy flat directories cannot accidentally become a valid modern dataset.
-        for label in ("GOOD", "NG"):
-            if any(p.is_file() and p.suffix.lower() in EXTENSIONS for p in (self.root / label).glob("*")):
-                raise DatasetIntegrityError(f"Legacy {label} images lack view/physical-part metadata; import them with explicit IDs")
-        return samples
+                hashes[sample.sha256] = sample
+                if (include_rejected or not (self.root / ".rejected" / f"{sample_id}.json").exists()) and (view is None or candidate_view == view):
+                    samples.append(sample)
+            return samples
 
-    def inventory(self, view: str | None = None) -> list[Sample]:
-        return self._scan(view=view)
+    def inventory(self, view: str | None = None, strict: bool = True) -> list[Sample]:
+        return self._scan(view=view, strict=strict)
+
+    def unmanaged_images(self, view: str | None = None) -> list[dict[str, Any]]:
+        with self._lock:
+            pending = []
+            for path, candidate_view, folder in self._paths():
+                try:
+                    self._details(path, candidate_view, folder)
+                except _MetadataRepairNeeded as exc:
+                    if view is None or candidate_view == view:
+                        pending.append({"path": str(path), "view": candidate_view, "label": folder,
+                                        "status": "repair_required" if self._sidecar(path).exists() else "unassigned",
+                                        "reason": str(exc)})
+            return pending
 
     def remove(self, sample_id: str, reason: str = "operator rejected sample") -> None:
-        sample = next((s for s in self._scan(include_rejected=True) if s.id == sample_id), None)
-        if sample is None:
-            raise KeyError(f"Unknown dataset sample: {sample_id}")
-        folder = self.root / ".rejected"
-        folder.mkdir(exist_ok=True)
-        target = folder / f"{sample.id}.json"
-        if not target.exists():
-            with target.open("x", encoding="utf-8") as stream:
-                json.dump({"id": sample.id, "sha256": sample.sha256, "reason": reason,
-                           "rejected_at": datetime.now(timezone.utc).isoformat()}, stream, indent=2)
+        with self._lock:
+            sample = next((s for s in self._scan(include_rejected=True, strict=False) if s.id == sample_id), None)
+            if sample is None:
+                raise KeyError(f"Unknown dataset sample: {sample_id}")
+            target = self.root / ".rejected" / f"{sample.id}.json"
+            if not target.exists():
+                _atomic_bytes(target, _json_bytes({"id": sample.id, "sha256": sample.sha256, "reason": reason,
+                                                 "rejected_at": datetime.now(timezone.utc).isoformat()}))
 
     def stats(self) -> dict[str, Any]:
-        all_samples = self._scan(include_rejected=True)
-        active = self.inventory()
-        views: dict[str, dict[str, int]] = {}
-        hashes: dict[str, list[str]] = {}
-        near: list[dict[str, Any]] = []
-        for index, sample in enumerate(active):
-            bucket = views.setdefault(sample.view, {"GOOD": 0, "NG": 0, "parts": 0})
-            bucket["GOOD" if sample.label == 0 else "NG"] += 1
-            hashes.setdefault(sample.sha256, []).append(sample.id)
-            left = sample.metadata.get("perceptual_hash")
-            if left:
-                for other in active[:index]:
-                    right = other.metadata.get("perceptual_hash")
-                    if right and sample.sha256 != other.sha256:
-                        distance = (int(left, 16) ^ int(right, 16)).bit_count()
-                        if distance <= 6:
-                            near.append({"samples": [other.id, sample.id], "hamming_distance": distance,
-                                         "warning": "Visually similar captures are not proof of independent parts"})
-        for view, bucket in views.items():
-            bucket["parts"] = len({s.part_id for s in active if s.view == view})
-        part_labels = {s.part_id: max(x.label for x in active if x.part_id == s.part_id) for s in active}
-        return {"images": len(active), "parts": len(part_labels),
-                "good_parts": sum(v == 0 for v in part_labels.values()),
-                "ng_parts": sum(v == 1 for v in part_labels.values()),
-                "rejected": len(all_samples) - len(active), "views": views,
-                "duplicates": {k: v for k, v in hashes.items() if len(v) > 1},
-                "near_duplicate_warnings": near,
-                "ng_sensitivity_validated": False}
+        with self._lock:
+            all_samples = self._scan(include_rejected=True, strict=False)
+            active = self.inventory(strict=False)
+            views: dict[str, dict[str, int]] = {}
+            hashes: dict[str, list[str]] = {}
+            near: list[dict[str, Any]] = []
+            for index, sample in enumerate(active):
+                bucket = views.setdefault(sample.view, {"GOOD": 0, "NG": 0, "parts": 0})
+                bucket["GOOD" if sample.label == 0 else "NG"] += 1
+                hashes.setdefault(sample.sha256, []).append(sample.id)
+                left = sample.metadata.get("perceptual_hash")
+                if left:
+                    for other in active[:index]:
+                        right = other.metadata.get("perceptual_hash")
+                        if right and sample.sha256 != other.sha256:
+                            distance = (int(left, 16) ^ int(right, 16)).bit_count()
+                            if distance <= 6:
+                                near.append({"samples": [other.id, sample.id], "hamming_distance": distance,
+                                             "warning": "Visually similar captures are not proof of independent parts"})
+            for candidate_view, bucket in views.items():
+                bucket["parts"] = len({s.part_id for s in active if s.view == candidate_view})
+            part_labels = {s.part_id: max(x.label for x in active if x.part_id == s.part_id) for s in active}
+            pending = self.unmanaged_images()
+            return {"images": len(active), "parts": len(part_labels),
+                    "good_parts": sum(v == 0 for v in part_labels.values()),
+                    "ng_parts": sum(v == 1 for v in part_labels.values()),
+                    "rejected": len(all_samples) - len(active), "views": views,
+                    "duplicates": {k: v for k, v in hashes.items() if len(v) > 1},
+                    "near_duplicate_warnings": near, "unmanaged_count": len(pending),
+                    "unmanaged_images": pending, "ng_sensitivity_validated": False}
 
 
 @dataclass

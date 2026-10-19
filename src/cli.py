@@ -17,12 +17,13 @@ def main(argv=None):
     commands.add_parser('dataset')
     commands.add_parser('models')
     commands.add_parser('history')
-    add = commands.add_parser('import')
-    add.add_argument('image', type=Path)
-    add.add_argument('--view', required=True)
-    add.add_argument('--label', required=True, choices=['GOOD', 'NG'])
-    add.add_argument('--part-id', required=True)
-    add.add_argument('--session-id', default='')
+    for name in ('import', 'repair'):
+        add = commands.add_parser(name)
+        add.add_argument('image', type=Path)
+        add.add_argument('--view', required=True)
+        add.add_argument('--label', required=True, choices=['GOOD', 'NG'])
+        add.add_argument('--part-id', required=True)
+        add.add_argument('--session-id', default='')
     for name in ('train', 'evaluate', 'benchmark'):
         command = commands.add_parser(name)
         command.add_argument('--view', required=True, help='inner_face, ribbed_face, or all for complete-view evaluation')
@@ -45,6 +46,8 @@ def main(argv=None):
         result = service.history()
     elif args.command == 'import':
         result = service.import_sample(args.image, args.view, args.label, args.part_id, args.session_id)
+    elif args.command == 'repair':
+        result = service.repair_sample(args.image, args.view, args.label, args.part_id, args.session_id)
     elif args.command == 'train':
         result = service.train(args.view, args.backend, progress)
     elif args.command == 'evaluate':

@@ -145,9 +145,10 @@ class WorkDialog(QDialog):
 
 
 class DatasetDialog(WorkDialog):
+    """Review managed samples and explicitly assign provenance to pending photos."""
     def __init__(self, service: Any, parent: QWidget | None = None):
         super().__init__(service, "Dataset Manager · physical-part provenance", parent)
-        intro = QLabel("Assign the same physical part ID to every capture of one housing. All captures of a part remain in one split. Import images from only the selected physical part in each batch.")
+        intro = QLabel("Assign the same physical part ID to every capture of one housing. Use one physical housing per import or repair batch; filenames never establish independent part IDs. Photos already in the dataset can be registered or repaired here without moving files or deleting metadata.")
         intro.setWordWrap(True)
         self.body.addWidget(intro)
         fields = QGridLayout()
@@ -163,89 +164,180 @@ class DatasetDialog(WorkDialog):
             fields.addWidget(QLabel(label), 0, index)
             fields.addWidget(widget, 1, index)
         self.body.addLayout(fields)
-        buttons = QHBoxLayout()
+        buttons = QGridLayout()
         self.import_button = QPushButton("Import Images…")
         self.import_button.clicked.connect(self.import_images)
+        self.repair_button = QPushButton("Register / Repair Selected")
+        self.repair_button.clicked.connect(self.repair_selected)
         self.capture_button = QPushButton("Capture Latest Camera Frame")
         self.capture_button.clicked.connect(self.capture_image)
         self.remove_button = QPushButton("Reject Selected Sample")
         self.remove_button.clicked.connect(self.remove_selected)
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.clicked.connect(self.refresh)
-        for button in [self.import_button, self.capture_button, self.remove_button, self.refresh_button]:
-            buttons.addWidget(button)
+        for index, button in enumerate([self.import_button, self.repair_button, self.capture_button, self.remove_button, self.refresh_button]):
+            buttons.addWidget(button, index // 3, index % 3)
         self.body.addLayout(buttons)
-        self._locked = [self.import_button, self.capture_button, self.remove_button, self.refresh_button, self.view, self.label, self.part_id, self.session_id]
+        self._locked = [self.import_button, self.repair_button, self.capture_button, self.remove_button,
+                        self.refresh_button, self.view, self.label, self.part_id, self.session_id]
         split = QSplitter(Qt.Orientation.Horizontal)
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Part ID", "View", "Label", "Sample", "Capture session"])
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["Status", "Part ID", "View", "Label", "Sample", "Capture session", "Details"])
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         self.table.itemSelectionChanged.connect(self.review_selected)
         split.addWidget(self.table)
-        self.preview = ImageCanvas("Select a saved sample to review")
+        self.preview = ImageCanvas("Select a saved or pending photo to review")
         split.addWidget(self.preview)
         self.body.addWidget(split, 1)
         self.statistics = QPlainTextEdit()
         self.statistics.setReadOnly(True)
-        self.statistics.setMaximumHeight(145)
+        self.statistics.setMaximumHeight(110)
         self.body.addWidget(self.statistics)
+        self.batch_report = QPlainTextEdit()
+        self.batch_report.setReadOnly(True)
+        self.batch_report.setMaximumHeight(145)
+        self.batch_report.hide()
+        self.body.addWidget(self.batch_report)
         self.finish_layout()
         self._samples: list[dict[str, Any]] = []
+        self._pending: list[dict[str, Any]] = []
+        self._entries: list[dict[str, Any]] = []
         self.refresh()
 
     def _identity(self) -> tuple[str, str, str, str] | None:
         identity = self.part_id.text().strip()
         if not identity:
-            error(self, "A physical part ID is required. Do not reuse one ID for different housings.")
+            error(self, "A physical part ID is required. Enter the identity of the actual housing; do not create a different ID for each filename or capture.")
             return None
         return str(self.view.currentData()), self.label.currentText(), identity, self.session_id.text().strip()
 
     def _inventory(self) -> dict:
-        return {"samples": self.service.samples(), "statistics": self.service.dataset_stats()}
+        samples = self.service.samples()
+        statistics = self.service.dataset_stats()
+        if hasattr(self.service, "pending_samples"):
+            pending = self.service.pending_samples()
+        else:
+            # Keep older providers and lightweight UI test services usable.
+            pending = statistics.get("pending", []) if isinstance(statistics, dict) else []
+        return {"samples": samples, "statistics": statistics,
+                "pending": pending if isinstance(pending, list) else []}
 
     def refresh(self) -> None:
         self.run(lambda progress: self._inventory(), self._apply_inventory)
 
+    @staticmethod
+    def _label_text(label: Any) -> str:
+        return "GOOD" if label in (0, "GOOD", "good") else "NG" if label in (1, "NG", "ng") else str(label or "Unassigned")
+
     def _apply_inventory(self, inventory: dict) -> None:
         self._samples = inventory["samples"]
-        self.table.setRowCount(len(self._samples))
-        for row, sample in enumerate(self._samples):
-            label = sample.get("label", "")
-            label = "GOOD" if label in (0, "GOOD", "good") else "NG" if label in (1, "NG", "ng") else str(label)
-            metadata = sample.get("metadata", {})
-            cells = [sample.get("part_id", ""), VIEW_LABELS.get(sample.get("view", ""), sample.get("view", "")), label,
-                     Path(str(sample.get("path", ""))).name, sample.get("session_id", metadata.get("session_id", ""))]
+        self._pending = inventory.get("pending", [])
+        self._entries = [{"pending": False, "sample": sample} for sample in self._samples]
+        self._entries.extend({"pending": True, "sample": sample} for sample in self._pending)
+        self.table.setRowCount(len(self._entries))
+        for row, entry in enumerate(self._entries):
+            sample = entry["sample"]
+            metadata = sample.get("metadata") or {}
+            pending = entry["pending"]
+            needs_repair = sample.get("status") in {"invalid_metadata", "repair_required"}
+            status = "Needs Repair" if pending and needs_repair else "Needs Registration" if pending else "Registered"
+            view = sample.get("view")
+            cells = [status, sample.get("part_id") or "Unassigned", VIEW_LABELS.get(view, view or "Select view above"),
+                     self._label_text(sample.get("label")), Path(str(sample.get("path", ""))).name,
+                     sample.get("session_id", metadata.get("session_id", "")), sample.get("reason", "")]
             for column, value in enumerate(cells):
-                self.table.setItem(row, column, QTableWidgetItem(str(value)))
+                item = QTableWidgetItem(str(value))
+                item.setToolTip(str(sample.get("path", "")) + ("\n" + str(sample["reason"]) if sample.get("reason") else ""))
+                self.table.setItem(row, column, item)
         self.statistics.setPlainText(json_text(inventory["statistics"]))
-        self.footer.setText(f"{len(self._samples)} valid saved samples · rejected samples are excluded from training.")
+        self.footer.setText(f"{len(self._samples)} registered samples · {len(self._pending)} photos need registration or repair." +
+            (" Select pending photos of one housing, enter its physical part ID and view above, then click Register / Repair Selected." if self._pending else " Rejected samples are excluded from training."))
+        self._update_selection_actions()
+
+    def _selected_entries(self) -> list[dict]:
+        selection = self.table.selectionModel()
+        return [self._entries[index.row()] for index in sorted(selection.selectedRows(), key=lambda value: value.row())
+                if 0 <= index.row() < len(self._entries)] if selection is not None else []
+
+    def _update_selection_actions(self) -> None:
+        selected = self._selected_entries()
+        self.repair_button.setEnabled(not self.busy and bool(selected) and all(entry["pending"] for entry in selected)
+                                      and hasattr(self.service, "repair_sample"))
+        self.remove_button.setEnabled(not self.busy and len(selected) == 1 and not selected[0]["pending"])
+
+    def _finished(self) -> None:
+        super()._finished()
+        self._update_selection_actions()
+
+    def _run_batch(self, files: list[str], identity: tuple[str, str, str, str], *, repair: bool) -> None:
+        operation_name = "Repair / registration" if repair else "Import"
+        def operation(progress: Callable) -> dict:
+            completed, failures = [], []
+            action = self.service.repair_sample if repair else self.service.import_sample
+            for index, path in enumerate(files):
+                try:
+                    completed.append({"source": path, "sample": action(path, *identity)})
+                except Exception as exc:
+                    failures.append({"source": path, "error": str(exc)})
+                progress(int(100 * (index + 1) / len(files)), f"{operation_name}: {index + 1}/{len(files)} photos processed")
+            # Preserve the outcome of every file even when a separate integrity
+            # conflict prevents refreshing the rest of the inventory.
+            result = {"completed": completed, "failures": failures, "identity": identity}
+            try:
+                result["inventory"] = self._inventory()
+            except Exception as exc:
+                result["inventory_error"] = str(exc)
+            return result
+        self.run(operation, self._batch_done)
+
+    def _batch_done(self, result: dict) -> None:
+        if "inventory" in result:
+            self._apply_inventory(result["inventory"])
+        completed, failures = result["completed"], result["failures"]
+        view, label, part, session = result["identity"]
+        lines = [f"{len(completed)} saved / registered; {len(failures)} failed.",
+                 f"Requested physical part: {part} · View: {VIEW_LABELS.get(view, view)} · Label: {label}" + (f" · Session: {session}" if session else "")]
+        for outcome in completed:
+            sample = outcome["sample"]
+            assigned = Path(str(sample.get("path", ""))).name
+            lines.append(f"SAVED: {Path(outcome['source']).name} → {assigned}")
+            stored_session = sample.get("session_id", (sample.get("metadata") or {}).get("session_id", ""))
+            if str(stored_session) != session:
+                lines.append(f"  Stored capture session: {stored_session or 'none'} (existing provenance retained).")
+            warnings = sample.get("warnings", sample.get("warning"))
+            if warnings:
+                lines.append("  Warning: " + str(warnings))
+        for outcome in failures:
+            lines.append(f"FAILED: {Path(outcome['source']).name} — {outcome['error']}")
+        if result.get("inventory_error"):
+            lines.append("Inventory refresh blocked by a separate integrity problem: " + result["inventory_error"])
+        self.batch_report.setPlainText("\n".join(lines))
+        self.batch_report.show()
+        self.footer.setText(f"{len(completed)} photos saved / registered · {len(failures)} failed. Review the named results above." +
+                            (" Inventory refresh is blocked; resolve the reported integrity problem before training." if result.get("inventory_error") else ""))
 
     def import_images(self) -> None:
         identity = self._identity()
         if identity is None:
             return
         files, _ = QFileDialog.getOpenFileNames(self, "Import captures of the selected physical part", "", "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff)")
-        if not files:
+        if files:
+            self._run_batch(files, identity, repair=False)
+
+    def repair_selected(self) -> None:
+        selected = self._selected_entries()
+        if not selected or not all(entry["pending"] for entry in selected):
+            self.footer.setText("Select only photos marked Needs Registration or Needs Repair. Registered samples keep their existing identity.")
             return
-        def operation(progress: Callable) -> dict:
-            imported, failures = [], []
-            for index, path in enumerate(files):
-                try:
-                    imported.append(self.service.import_sample(path, *identity))
-                except Exception as exc:
-                    failures.append(f"{Path(path).name}: {exc}")
-                progress(int(100 * (index + 1) / len(files)), f"Imported {index + 1}/{len(files)}")
-            return {"imported": imported, "failures": failures, "inventory": self._inventory()}
-        def done(result: dict) -> None:
-            self._apply_inventory(result["inventory"])
-            self.footer.setText(f"Saved {len(result['imported'])} samples. {len(result['failures'])} rejected imports.")
-            warnings = [str(row.get("warnings", row.get("warning", ""))) for row in result["imported"] if row.get("warnings") or row.get("warning")]
-            if result["failures"] or warnings:
-                QMessageBox.information(self, "Dataset integrity results", "\n".join(result["failures"] + warnings))
-        self.run(operation, done)
+        if not hasattr(self.service, "repair_sample"):
+            error(self, "This dataset provider does not support metadata repair.")
+            return
+        identity = self._identity()
+        if identity is not None:
+            self._run_batch([str(entry["sample"]["path"]) for entry in selected], identity, repair=True)
 
     def capture_image(self) -> None:
         identity = self._identity()
@@ -260,25 +352,27 @@ class DatasetDialog(WorkDialog):
             error(self, exc)
             return
         def operation(progress: Callable) -> dict:
-            result = self.service.capture_sample(image, *identity)
-            return {"sample": result, "inventory": self._inventory()}
-        self.run(operation, self._capture_done)
-
-    def _capture_done(self, result: dict) -> None:
-        self._apply_inventory(result["inventory"])
-        sample = result["sample"]
-        self.footer.setText("Camera sample saved. " + str(sample.get("warnings", sample.get("warning", ""))))
+            sample = self.service.capture_sample(image, *identity)
+            result = {"completed": [{"source": "Live camera capture", "sample": sample}], "failures": [], "identity": identity}
+            try:
+                result["inventory"] = self._inventory()
+            except Exception as exc:
+                result["inventory_error"] = str(exc)
+            return result
+        self.run(operation, self._batch_done)
 
     def review_selected(self) -> None:
+        self._update_selection_actions()
         index = self.table.currentRow()
-        if 0 <= index < len(self._samples):
-            self.preview.set_image(read_image(str(self._samples[index].get("path", ""))))
+        if 0 <= index < len(self._entries):
+            self.preview.set_image(read_image(str(self._entries[index]["sample"].get("path", ""))))
 
     def remove_selected(self) -> None:
-        index = self.table.currentRow()
-        if not 0 <= index < len(self._samples):
+        selected = self._selected_entries()
+        if len(selected) != 1 or selected[0]["pending"]:
+            self.footer.setText("Only a registered sample can be rejected. Pending photos must be registered or repaired first.")
             return
-        sample = self._samples[index]
+        sample = selected[0]["sample"]
         def operation(progress: Callable) -> dict:
             self.service.remove_sample(str(sample["id"]))
             return self._inventory()

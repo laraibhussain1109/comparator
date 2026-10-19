@@ -21,3 +21,5 @@ dataset/*.json
 reports/
 weights/
 .neural/
+dataset/.metadata/
+dataset/.rejected/
