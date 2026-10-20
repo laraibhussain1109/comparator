@@ -148,7 +148,7 @@ class DatasetDialog(WorkDialog):
     """Review managed samples and explicitly assign provenance to pending photos."""
     def __init__(self, service: Any, parent: QWidget | None = None):
         super().__init__(service, "Dataset Manager · physical-part provenance", parent)
-        intro = QLabel("Assign the same physical part ID to every capture of one housing. Use one physical housing per import or repair batch; filenames never establish independent part IDs. Photos already in the dataset can be registered or repaired here without moving files or deleting metadata.")
+        intro = QLabel("Assign the same physical part ID to every capture of one housing. Use one physical housing per import or repair batch; filenames never establish independent part IDs. If any capture of a housing is labelled NG, that whole housing is excluded from normal training, including its GOOD captures. Photos already in the dataset can be registered or repaired here.")
         intro.setWordWrap(True)
         self.body.addWidget(intro)
         fields = QGridLayout()
@@ -157,7 +157,8 @@ class DatasetDialog(WorkDialog):
         self.label = QComboBox()
         self.label.addItems(["GOOD", "NG"])
         self.part_id = QLineEdit()
-        self.part_id.setPlaceholderText("Required physical part ID")
+        self.part_id.setPlaceholderText("Individual housing ID, e.g. housing-017")
+        self.part_id.setToolTip("Use one ID per actual physical housing, across both faces and every repeat capture. A product/model name shared by different housings is not a physical part ID.")
         self.session_id = QLineEdit()
         self.session_id.setPlaceholderText("Optional batch / capture session")
         for index, (label, widget) in enumerate([("View", self.view), ("Label", self.label), ("Physical part", self.part_id), ("Capture session", self.session_id)]):
@@ -445,6 +446,11 @@ class TrainingDialog(WorkDialog):
         description = QLabel("Evaluation uses the same inference and decision pipeline on held-out physical parts. RECHECK remains in the report. No accuracy is reported before a real evaluation." if evaluate else "Training and reference selection use only training parts. Thresholds use validation parts. Untouched test parts stay separate. GOOD-only training is supported; sensitivity remains unvalidated without independent NG parts.")
         description.setWordWrap(True)
         self.body.addWidget(description)
+        self.readiness = QLabel("")
+        self.readiness.setWordWrap(True)
+        self.readiness.setTextFormat(Qt.TextFormat.PlainText)
+        self.readiness.setVisible(not evaluate)
+        self.body.addWidget(self.readiness)
         self.stats = QPlainTextEdit()
         self.stats.setReadOnly(True)
         self.stats.setMaximumHeight(135)
@@ -484,8 +490,15 @@ class TrainingDialog(WorkDialog):
 
     def refresh(self) -> None:
         try:
-            self.stats.setPlainText(json_text(self.service.dataset_stats()))
+            statistics = self.service.dataset_stats()
+            readiness = statistics.get("training_readiness", {})
+            # Show capture labels separately from whole-housing eligibility.
+            # A saved GOOD image remains GOOD even when its housing has NG views.
+            self.readiness.setText(str(readiness.get("message", "")))
+            self.readiness.setStyleSheet("color: #f4ca64;" if readiness and not readiness.get("can_split") else "")
+            self.stats.setPlainText(json_text(statistics))
         except Exception as exc:
+            self.readiness.setText("")
             self.stats.setPlainText(str(exc))
 
     def _progress(self, percent: int, message: str) -> None:
@@ -506,6 +519,7 @@ class TrainingDialog(WorkDialog):
             except Exception as exc:
                 error(self, exc)
                 return
+            self.refresh()
         self.output.clear()
         self.export.setEnabled(False)
         operation = self.service.evaluate if self.evaluate else self.service.train

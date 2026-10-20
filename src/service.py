@@ -93,7 +93,7 @@ class NeuroIrisService:
                 'metrology': 'Image pixels/normalized geometry; no validated physical calibration'}
 
     def dataset_stats(self) -> dict:
-        return self.dataset.stats()
+        return self.dataset.stats(group_sessions=bool(self.config.get('dataset', {}).get('group_sessions', False)))
 
     def samples(self, view=None) -> list[dict]:
         # A pending registration must not prevent opening Dataset Manager to fix it.

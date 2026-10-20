@@ -60,6 +60,8 @@ Training splits **globally by physical ID across all views**, not by image. Opti
 
 NG data is optional for GOOD-only research training. Without independent NG validation/test parts, missed-defect rate and defect recall remain unknown (`null`), not 0% or 100%. No automatic defect type is assigned to a generic neural anomaly.
 
+The training screen lists **GOOD/NG image counts separately from eligible physical housings**. If one housing ID has both GOOD and NG captures, its GOOD files keep their image labels, but the whole housing is excluded from normal training. For example, 500 GOOD images and 281 NG images all assigned to `LEMON` remain 781 images of one NG housing, with zero independent GOOD housings available. Successful import alone does not make this dataset eligible for an independent train/validation/test split. Keep the same real ID for repeat captures, including before/after-defect captures; collect independent GOOD housings for this workflow. If capture-session grouping is enabled, the summary also shows the resulting independent group count.
+
 ## Repair missing or damaged image metadata
 
 If training reports `Invalid provenance metadata ... .jpg.json: Expecting value`, update to the latest `codex/neuroiris-inspection-system` branch and keep your existing `dataset` directory. Do not delete photographs or create empty JSON files to bypass the error.

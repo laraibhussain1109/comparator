@@ -513,7 +513,7 @@ class DatasetStore:
                 _atomic_bytes(target, _json_bytes({"id": sample.id, "sha256": sample.sha256, "reason": reason,
                                                  "rejected_at": datetime.now(timezone.utc).isoformat()}))
 
-    def stats(self) -> dict[str, Any]:
+    def stats(self, *, group_sessions: bool = False) -> dict[str, Any]:
         with self._lock:
             all_samples = self._scan(include_rejected=True, strict=False)
             active = self.inventory(strict=False)
@@ -535,11 +535,12 @@ class DatasetStore:
                                              "warning": "Visually similar captures are not proof of independent parts"})
             for candidate_view, bucket in views.items():
                 bucket["parts"] = len({s.part_id for s in active if s.view == candidate_view})
-            part_labels = {s.part_id: max(x.label for x in active if x.part_id == s.part_id) for s in active}
+            readiness = training_readiness(active, group_sessions=group_sessions)
             pending = self.unmanaged_images()
-            return {"images": len(active), "parts": len(part_labels),
-                    "good_parts": sum(v == 0 for v in part_labels.values()),
-                    "ng_parts": sum(v == 1 for v in part_labels.values()),
+            return {"images": len(active), "parts": readiness["parts"],
+                    "good_images": readiness["good_images"], "ng_images": readiness["ng_images"],
+                    "good_parts": readiness["good_parts"], "ng_parts": readiness["ng_parts"],
+                    "training_readiness": readiness,
                     "rejected": len(all_samples) - len(active), "views": views,
                     "duplicates": {k: v for k, v in hashes.items() if len(v) > 1},
                     "near_duplicate_warnings": near, "unmanaged_count": len(pending),
@@ -559,17 +560,8 @@ class DatasetSplit:
                    for name in ("train", "validation", "test")}}
 
 
-def split_by_part(samples: Iterable[Sample], seed: int = 42,
-                  ratios: tuple[float, float, float] = (.7, .15, .15), *,
-                  group_sessions: bool = False) -> DatasetSplit:
-    """Split globally across views; NG physical parts never enter normal training.
-
-    Session grouping is opt-in because a single acquisition day may include the
-    entire initial dataset. When enabled, connected session/part groups stay whole.
-    """
-    samples = list(samples)
-    if len(ratios) != 3 or any(not np.isfinite(x) or x <= 0 for x in ratios) or not np.isclose(sum(ratios), 1):
-        raise ValueError("Three positive split ratios summing to one are required")
+def _training_groups(samples: list[Sample], group_sessions: bool) -> dict[str, list[Sample]]:
+    """Validate provenance claims and group parts exactly as the split does."""
     parents = {s.part_id: s.part_id for s in samples}
     def find(value: str) -> str:
         while parents[value] != value:
@@ -590,10 +582,107 @@ def split_by_part(samples: Iterable[Sample], seed: int = 42,
     groups: dict[str, list[Sample]] = {}
     for sample in samples:
         groups.setdefault(find(sample.part_id), []).append(sample)
+    return groups
+
+
+def _example_ids(values: Iterable[str], limit: int = 2) -> str:
+    """Keep messages usable when identities are numerous or unusually long."""
+    values = sorted(set(values))
+    examples = [repr(value if len(value) <= 32 else value[:29] + "...") for value in values[:limit]]
+    if len(values) > limit:
+        examples.append(f"and {len(values) - limit} more")
+    return ", ".join(examples)
+
+
+def _readiness_report(samples: list[Sample], groups: dict[str, list[Sample]],
+                      group_sessions: bool) -> dict[str, Any]:
+    by_part: dict[str, list[Sample]] = {}
+    for sample in samples:
+        by_part.setdefault(sample.part_id, []).append(sample)
+    details = []
+    for part_id, captures in sorted(by_part.items()):
+        good_images = sum(s.label == 0 for s in captures)
+        ng_images = len(captures) - good_images
+        details.append({"part_id": part_id, "images": len(captures),
+                        "good_images": good_images, "ng_images": ng_images,
+                        "label": "NG" if ng_images else "GOOD",
+                        "mixed_labels": bool(good_images and ng_images),
+                        "views": sorted({s.view for s in captures}),
+                        "session_ids": sorted({s.session_id for s in captures if s.session_id})})
+    good_parts = sum(part["label"] == "GOOD" for part in details)
+    ng_parts = len(details) - good_parts
+    mixed_parts = sum(part["mixed_labels"] for part in details)
+    good_images = sum(s.label == 0 for s in samples)
+    good_groups = sum(not any(s.label for s in captures) for captures in groups.values())
+    ng_groups = len(groups) - good_groups
+    can_split = good_groups >= 3
+    messages = [f"{len(samples)} images ({good_images} GOOD, {len(samples) - good_images} NG); "
+                f"{len(details)} physical housing(s): {good_parts} GOOD, {ng_parts} NG "
+                f"({mixed_parts} mixed-label). Independent GOOD groups: {good_groups}/3."]
+    if len(details) == 1:
+        messages.append(f"All images share physical part ID {_example_ids(by_part)}. "
+                        "Repeated photos still count as one housing.")
+    if ng_parts:
+        examples = _example_ids(part["part_id"] for part in details if part["ng_images"])
+        messages.append("Any NG-labelled capture excludes all views of its housing from normal "
+                        f"training, even with other GOOD photos (IDs: {examples}).")
+    if group_sessions:
+        messages.append(f"Session grouping: {len(details)} physical housing(s) form "
+                        f"{len(groups)} independent group(s).")
+        sessions: dict[str, set[str]] = {}
+        for sample in samples:
+            if sample.session_id:
+                sessions.setdefault(sample.session_id, set()).add(sample.part_id)
+        shared = [session for session, part_ids in sessions.items() if len(part_ids) > 1]
+        if shared:
+            messages.append(f"Shared capture sessions ({_example_ids(shared)}) keep parts together; "
+                            "NG excludes its whole session group.")
+    if can_split:
+        messages.append("Group minimum met. Selected-face coverage and image quality still need validation.")
+    else:
+        messages.append("At least 3 independent GOOD parts/groups are needed for separate "
+                        "train/validation/test sets.")
+        if samples:
+            messages.append("Review IDs and labels in Dataset Manager; keep originals before correcting "
+                            "mistaken imports. Capture more actual GOOD housings; never invent IDs for repeats.")
+        else:
+            messages.append("Import captures of actual GOOD housings in Dataset Manager, using the same "
+                            "physical part ID for every capture of each housing.")
+    return {"images": len(samples), "good_images": good_images, "ng_images": len(samples) - good_images,
+            "parts": len(details), "good_parts": good_parts, "ng_parts": ng_parts,
+            "mixed_label_parts": mixed_parts, "part_details": details,
+            "eligible_good_groups": good_groups, "eligible_ng_groups": ng_groups,
+            "group_sessions": bool(group_sessions), "minimum_good_groups": 3,
+            "can_split": can_split, "message": " ".join(messages)}
+
+
+def training_readiness(samples: Iterable[Sample], *, group_sessions: bool = False) -> dict[str, Any]:
+    """Explain the global independent-GOOD-group requirement without changing data.
+
+    ``can_split`` covers only the minimum global group count. The training service
+    also checks selected-face coverage, image quality and backend prerequisites.
+    Duplicate/conflicting identity claims fail exactly as they do during splitting.
+    """
+    samples = list(samples)
+    return _readiness_report(samples, _training_groups(samples, group_sessions), group_sessions)
+
+
+def split_by_part(samples: Iterable[Sample], seed: int = 42,
+                  ratios: tuple[float, float, float] = (.7, .15, .15), *,
+                  group_sessions: bool = False) -> DatasetSplit:
+    """Split globally across views; NG physical parts never enter normal training.
+
+    Session grouping is opt-in because a single acquisition day may include the
+    entire initial dataset. When enabled, connected session/part groups stay whole.
+    """
+    samples = list(samples)
+    if len(ratios) != 3 or any(not np.isfinite(x) or x <= 0 for x in ratios) or not np.isclose(sum(ratios), 1):
+        raise ValueError("Three positive split ratios summing to one are required")
+    groups = _training_groups(samples, group_sessions)
     good = sorted(key for key, values in groups.items() if not any(s.label for s in values))
     ng = sorted(key for key, values in groups.items() if any(s.label for s in values))
     if len(good) < 3:
-        raise ValueError("At least 3 independent GOOD physical parts/groups are required for train, validation and untouched test partitions")
+        raise ValueError(_readiness_report(samples, groups, group_sessions)["message"])
     rng = random.Random(seed)
     rng.shuffle(good)
     rng.shuffle(ng)
