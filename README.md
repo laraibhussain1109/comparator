@@ -80,6 +80,12 @@ The same explicit repair is available from PowerShell:
 
 ## Commission the view and train
 
+Training automatically screens the selected view's GOOD training captures. Images that fail focus/exposure, complete-housing detection, landmark registration, or the inspection ROI are excluded from that run. Reference selection prefers the most represented native resolution before sharpness; it must pass the same checks, and another suitable reference is tried when necessary. Training continues with the accepted captures, without changing quality limits or the saved physical-part split.
+
+The **Automatic image screening** panel lists accepted/excluded counts, each excluded filename and reason, measured quality, and the saved JSON report path. Original images, labels and metadata are retained, so a run-specific exclusion does not permanently reject a dataset sample. Reports are saved under `inspection_results/training_screening/<product>/<view>/` (or the configured results directory), including failed attempts, and successful model bundles contain their own screening report and actual accepted sample IDs.
+
+If no usable training captures remain, training stops with the exclusion counts and reasons; the previous model stays active. Validation and test captures retain their original assignments. Invalid validation captures are reported, and invalid test captures remain in evaluation as RECHECK observations. A failed validation/calibration stage still needs suitable independent validation captures; the software never promotes held-out images into training to replace excluded captures.
+
 1. Connect the Makose camera and select its exact index in **CAMERA SETTINGS**. No fallback to another index occurs. Check **actual** decoded resolution, FOURCC and measured capture FPS. A requested 3840×2160 setting alone is insufficient. If the device negotiates a different resolution/format, live analysis returns RECHECK until commissioned correctly.
 2. Fix the focus/exposure and lighting where supported. Unsupported driver settings show failed readback. Tune ROI sharpness, clipping and motion limits using actual acceptable captures. Reflective highlights, blur, incomplete framing and moving parts must not be accepted by weakening gates without validation.
 3. Enter technician mode. On first use, create a local PIN (at least six characters); it is stored as a salted PBKDF2 hash under `runtime/`. Advanced settings are locked again after restart. This is an operator-change lock, not an operating-system access-control boundary.

@@ -1,6 +1,6 @@
 """Application use cases shared by the desktop HMI and command-line workflows."""
 from __future__ import annotations
-from collections import deque
+from collections import Counter, deque
 import copy
 from datetime import datetime, timezone
 import importlib.metadata
@@ -365,12 +365,211 @@ class NeuroIrisService:
                  if p.is_file() and p.name != 'manifest.json'}
         atomic_json(directory / 'manifest.json', {**metadata, 'schema_version': 1, 'files': files})
 
+    def _screening_directory(self, view):
+        return (Path(self.config['paths']['results']) / 'training_screening' /
+                safe_name(self.config['product']) / safe_name(view))
+
+    def training_screening(self, view):
+        """Latest read-only screening report, including failed training attempts."""
+        path = self._screening_directory(view) / 'latest.json'
+        if not path.is_file():
+            return {}
+        report = json.loads(path.read_text(encoding='utf-8'))
+        # An external audit write can fail after atomic model activation. The
+        # completed, immutable bundle then remains the authoritative run record.
+        if report.get('status') != 'completed' and report.get('backend') in MODES:
+            try:
+                directory = self.artifacts.root / safe_name(view)
+                pointer = json.loads((directory / f'active-{report["backend"]}.json').read_text(encoding='utf-8'))
+                bundled_path = directory / safe_name(pointer['version']) / 'training_screening.json'
+                bundled = json.loads(bundled_path.read_text(encoding='utf-8'))
+                if bundled.get('run_id') == report.get('run_id') and bundled.get('status') == 'completed':
+                    return {**bundled, 'report_path': str(bundled_path)}
+            except (OSError, KeyError, TypeError, ValueError):
+                pass
+        return report
+
+    def _save_training_screening(self, report):
+        # Keep audit records outside model staging so failed attempts retain them.
+        payload = _jsonable(report)
+        atomic_json(Path(report['report_path']), payload)
+        atomic_json(self._screening_directory(report['view']) / 'latest.json', payload)
+
+    def _screen_training_images(self, samples, settings, rois, report, emit):
+        """Exclude unsuitable GOOD train captures without modifying the dataset."""
+        quality = QualityChecker(settings['quality'])
+        locator = HousingLocator()
+        report.update(candidate_images=len(samples), candidate_sample_ids=[s.id for s in samples],
+                      quality_settings=quality.settings, registration_settings=settings['registration'],
+                      rois=copy.deepcopy(rois))
+        self._save_training_screening(report)
+        excluded_ids = set()
+        screening_percent = 2
+
+        def notify(percent, message):
+            nonlocal screening_percent
+            screening_percent = max(screening_percent, percent)
+            emit(screening_percent, 'Training image screening', message)
+
+        def exclude(sample, stage, reasons, metrics):
+            excluded_ids.add(sample.id)
+            report['excluded'].append({'sample_id': sample.id, 'filename': sample.path.name,
+                                       'path': str(sample.path), 'part_id': sample.part_id,
+                                       'view': sample.view, 'sha256': sample.sha256,
+                                       'stage': stage, 'reasons': list(reasons), 'metrics': metrics})
+            report['excluded_images'] = len(report['excluded'])
+            self._save_training_screening(report)
+            notify(screening_percent,
+                   f'Automatically excluded {sample.path.name}: {"; ".join(reasons)}. Original retained.')
+
+        def load(sample):
+            # Integrity violations remain fatal; they are not capture-quality failures.
+            if digest(sample.path) != sample.sha256:
+                raise DatasetIntegrityError(f'Training image bytes changed after inventory: {sample.path}')
+            return read_image(sample.path)
+
+        candidates = []
+        for index, sample in enumerate(samples):
+            notify(2 + int(5 * index / max(1, len(samples))),
+                   f'Checking capture quality {index + 1}/{len(samples)}: {sample.path.name}')
+            try:
+                image = load(sample)
+            except (ValueError, cv2.error) as exc:
+                if isinstance(exc, DatasetIntegrityError):
+                    raise
+                exclude(sample, 'quality', ['unreadable_image', str(exc)], {})
+                continue
+            pose = locator.detect(image)
+            checked = quality.check(image, mask=pose.mask if pose else None)
+            reasons = list(checked.reasons)
+            if pose is None:
+                reasons.append('complete_housing_not_located')
+            elif not pose.complete:
+                reasons.append('housing_clipped_at_frame_edge')
+            if reasons:
+                exclude(sample, 'quality', reasons, checked.metrics)
+                continue
+            candidates.append((sample, checked.metrics, [image.shape[1], image.shape[0]]))
+            # Do not retain a second full-resolution copy of every candidate.
+            del image
+
+        def registered_mask(registration, metrics):
+            confidence = float(registration.confidence)
+            metrics = {**metrics, 'registration_confidence': confidence if np.isfinite(confidence) else None}
+            if (not registration.valid or not np.isfinite(registration.confidence) or
+                    registration.confidence < settings['registration']['min_confidence']):
+                reasons = list(registration.reasons) if not registration.valid else []
+                return None, 'registration', reasons or ['insufficient_registration_confidence'], metrics
+            pose = locator.detect(registration.image)
+            if pose is None or not pose.complete:
+                return None, 'aligned_pose', ['registered_housing_not_complete'], metrics
+            mask = cv2.bitwise_and(pose.mask, roi_mask(registration.image.shape, rois))
+            pixels = int(np.count_nonzero(mask))
+            metrics['roi_pixels'] = pixels
+            minimum_pixels = max(30, int(np.ceil(.02 * np.pi * pose.radius ** 2)))
+            metrics['minimum_roi_pixels'] = minimum_pixels
+            if pixels < minimum_pixels:
+                return None, 'roi', ['inspection_roi_has_too_few_part_pixels'], metrics
+            return mask, None, [], metrics
+
+        template = registrar = template_registration = None
+        template_sample = None
+        notify(8, 'Checking reference-image landmarks and inspection ROI')
+        # A sharp silhouette alone is not a usable master: require internal landmarks.
+        # Prefer the represented native resolution over a lone sharp thumbnail.
+        resolution_counts = Counter(tuple(row[2]) for row in candidates)
+        report['template_selection'] = 'Most represented native resolution, then highest sharpness; valid landmarks and ROI required'
+        for sample, metrics, _ in sorted(candidates, key=lambda row: (
+                -resolution_counts[tuple(row[2])], -row[1].get('sharpness', 0))):
+            image = load(sample)
+            try:
+                candidate_registrar = LandmarkRegistrar(image, settings['registration'])
+                registration = candidate_registrar.register(image)
+                mask, stage, reasons, measured = registered_mask(registration, metrics)
+            except cv2.error as exc:
+                exclude(sample, 'registration', ['registration_error', str(exc)], metrics)
+                continue
+            if mask is None:
+                exclude(sample, stage, reasons, measured)
+                continue
+            template, registrar, template_registration = image, candidate_registrar, registration
+            template_sample = sample
+            report.update(template_sample_id=sample.id, template_sha256=sample.sha256)
+            break
+
+        accepted, aligned, masks, resolutions = [], [], [], []
+        if template is not None:
+            for sample, metrics, resolution in candidates:
+                if sample.id in excluded_ids:
+                    continue
+                try:
+                    registration = (template_registration if sample.id == template_sample.id else
+                                    registrar.register(load(sample)))
+                    mask, stage, reasons, measured = registered_mask(registration, metrics)
+                except cv2.error as exc:
+                    exclude(sample, 'registration', ['registration_error', str(exc)], metrics)
+                    continue
+                if mask is None:
+                    exclude(sample, stage, reasons, measured)
+                    continue
+                accepted.append(sample)
+                aligned.append(registration.image)
+                masks.append(mask)
+                resolutions.append(tuple(resolution))
+                report['accepted_sample_ids'] = [s.id for s in accepted]
+                report['accepted_images'] = len(accepted)
+                notify(12, f'{len(accepted)} usable training captures; '
+                           f'{report["excluded_images"]} automatically excluded')
+        report.update(status='screened', accepted_images=len(accepted),
+                      accepted_sample_ids=[s.id for s in accepted],
+                      accepted_part_ids=sorted({s.part_id for s in accepted}),
+                      source_resolutions=sorted(set(resolutions)))
+        self._save_training_screening(report)
+        if not accepted:
+            reasons = sorted({reason for row in report['excluded'] for reason in row['reasons']})
+            raise ValueError(
+                f'No usable GOOD training captures remain: 0 accepted; {report["excluded_images"]} of '
+                f'{report["candidate_images"]} automatically excluded ({"; ".join(reasons)}). '
+                'Originals were retained. Recapture clear, fully visible housings with identifiable '
+                f'landmarks, and review the inspection ROI. Report: {report["report_path"]}')
+        notify(14, f'Using {len(accepted)} GOOD captures; {report["excluded_images"]} automatically excluded. '
+                   f'Report: {report["report_path"]}')
+        return template, accepted, aligned, masks
+
     def train(self, view, backend='efficientad', progress: Callable | None = None):
         with self._operation_lock:
             self._require_idle()
-            return self._train(view, backend, progress)
+            if backend not in MODES:
+                raise ValueError('EfficientAD and geometry are the implemented training backends')
+            if view not in self.config['views']['enabled']:
+                raise ValueError('Select an enabled view')
+            run_id = uuid.uuid4().hex
+            screening = {'schema_version': 1, 'run_id': run_id, 'view': view,
+                         'backend': 'efficientad' if backend == 'hybrid' else backend,
+                         'started_at': datetime.now(timezone.utc).isoformat(), 'status': 'screening',
+                         'candidate_images': 0, 'accepted_images': 0, 'excluded_images': 0,
+                         'candidate_sample_ids': [], 'accepted_sample_ids': [], 'excluded': [],
+                         'report_path': str(self._screening_directory(view) / (run_id + '.json'))}
+            self._save_training_screening(screening)
+            try:
+                result = self._train(view, backend, progress, screening)
+            except Exception as exc:
+                screening.update(status='failed', error=str(exc), finished_at=datetime.now(timezone.utc).isoformat())
+                self._save_training_screening(screening)
+                raise
+            screening = copy.deepcopy(result['training_screening'])
+            try:
+                self._save_training_screening(screening)
+            except OSError as exc:
+                # Publication has succeeded. Preserve its successful outcome and
+                # point the user at the already-written, verified bundle report.
+                screening['report_path'] = str(Path(result['artifact_path']) / 'training_screening.json')
+                result['warnings'].append(
+                    f'Model saved successfully; the external screening report could not be finalized: {exc}. '
+                    f'The completed report is retained in the model bundle: {screening["report_path"]}')
+            return {**result, 'training_screening': screening}
 
-    def _train(self, view, backend, progress):
+    def _train(self, view, backend, progress, screening):
         if backend not in MODES:
             raise ValueError('EfficientAD and geometry are the implemented training backends')
         if view not in self.config['views']['enabled']:
@@ -399,38 +598,19 @@ class NeuroIrisService:
         if not good_train or not good_val or not selected['test']:
             raise ValueError('This view needs independent GOOD train/validation parts and untouched test parts. Capture each configured face for the same physical IDs.')
         settings = self._settings_snapshot()
-        quality = QualityChecker(settings['quality'])
-        locator = HousingLocator()
         rois = self.get_rois(view)
         started = time.perf_counter()
-        decoded = []
-        for sample in good_train:
-            image = read_image(sample.path)
-            pose = locator.detect(image)
-            report = quality.check(image, mask=pose.mask if pose else None)
-            if pose is None or not pose.complete or not report.valid:
-                raise ValueError(f'Invalid GOOD training image {sample.path.name}: {report.reasons or ["complete housing not located"]}. Reject or recapture it in Dataset Manager.')
-            decoded.append((image, report.metrics.get('sharpness', 0)))
-        template = max(decoded, key=lambda item: item[1])[0]
-        registrar = LandmarkRegistrar(template, settings['registration'])
-        aligned = []
-        masks = []
-        for image, _ in decoded:
-            registration = registrar.register(image)
-            if not registration.valid or registration.confidence < settings['registration']['min_confidence']:
-                raise ValueError('GOOD training image cannot be registered with internal landmarks: ' + '; '.join(registration.reasons))
-            image = registration.image
-            pose = locator.detect(image)
-            aligned.append(image)
-            masks.append(cv2.bitwise_and(pose.mask, roi_mask(image.shape, rois)))
+        template, good_train, aligned, masks = self._screen_training_images(
+            good_train, settings, rois, screening, emit)
         emit(15, 'Geometry', f'Learning {view} geometry using GOOD training parts only')
         geometry = GeometryProfile(view, settings['geometry'])
         geometry.fit(aligned, masks=masks)
         version = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S') + '-' + uuid.uuid4().hex[:8]
         metadata = {'version': version, 'product': self.config['product'], 'view': view,
                     'backend': backend, 'settings': settings, 'rois': rois,
-                    'source_resolutions': sorted({(image.shape[1], image.shape[0]) for image, _ in decoded}),
+                    'source_resolutions': screening['source_resolutions'],
                     'split': split.manifest(), 'training_parts': sorted({s.part_id for s in split.train}),
+                    'training_accepted_sample_ids': list(screening['accepted_sample_ids']),
                     'validation_parts': sorted({s.part_id for s in split.validation}),
                     'test_parts': sorted({s.part_id for s in split.test}),
                     'packages': {name: importlib.metadata.version(name) for name in
@@ -468,11 +648,17 @@ class NeuroIrisService:
                 if data.valid:
                     validation.append((sample, data))
                 else:
-                    invalid_validation.append({'sample_id': sample.id, 'part_id': sample.part_id, 'reasons': data.reasons})
+                    invalid_validation.append({'sample_id': sample.id, 'part_id': sample.part_id,
+                                               'filename': sample.path.name, 'view': sample.view,
+                                               'path': str(sample.path), 'reasons': data.reasons})
+            screening['invalid_validation_captures'] = invalid_validation
+            self._save_training_screening(screening)
             ng_part_ids = {s.part_id for s in samples if s.label == 1}
             valid_good = [(s, d) for s, d in validation if s.label == 0 and s.part_id not in ng_part_ids]
             if not valid_good:
-                raise ValueError('No independent GOOD validation captures passed quality and landmark registration; calibration cannot proceed')
+                raise ValueError('No independent GOOD validation captures passed quality and landmark registration; '
+                                 'calibration cannot proceed. Recapture suitable validation images for the reserved '
+                                 f'physical parts. Report: {screening["report_path"]}')
             branches = 2 if backend == 'efficientad' else 1
             budgets = branches * len(self.config['views']['required'])
             limits = {'part_fpr_target': settings['calibration']['target_fpr'],
@@ -510,6 +696,14 @@ class NeuroIrisService:
                        'elapsed_seconds': time.perf_counter() - started, 'thresholds': limits,
                        'test': report['parts'], 'report': report,
                        'warnings': metadata['limitations'] + report.get('warnings', [])}
+            completed_screening = {**screening, 'status': 'completed',
+                                   'finished_at': datetime.now(timezone.utc).isoformat()}
+            metadata['training_screening'] = completed_screening
+            summary['training_screening'] = completed_screening
+            if screening['excluded_images']:
+                summary['warnings'].append(f'{screening["excluded_images"]} unsuitable training captures were '
+                                           'automatically excluded; original files and labels were retained.')
+            atomic_json(stage / 'training_screening.json', completed_screening)
             atomic_json(stage / 'training_summary.json', summary)
             target = self.artifacts.publish(stage, metadata)
             self._pipelines.clear()

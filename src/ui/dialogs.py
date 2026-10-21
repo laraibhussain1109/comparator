@@ -10,6 +10,7 @@ from typing import Any, Callable
 import cv2
 import numpy as np
 from PyQt6.QtCore import QThread, QTimer, Qt
+from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QProgressBar,
@@ -388,6 +389,12 @@ class TrainingDialog(WorkDialog):
         super().__init__(service, "Evaluate Model · blind held-out parts" if evaluate else "Train Model · view-specific learning", parent)
         self.evaluate = evaluate
         self.report: dict[str, Any] = {}
+        self.screening_report: dict[str, Any] = {}
+        self._screening_run_before: str | None = None
+        self._screening_baseline_known = False
+        self._screening_requested_view: str | None = None
+        self._screening_attempt_active = False
+        self.footer.setTextFormat(Qt.TextFormat.PlainText)
         settings = service.config.get("models", {})
         form = QFormLayout()
         product = service.config.get("product", "Aluminium LED housing")
@@ -455,6 +462,18 @@ class TrainingDialog(WorkDialog):
         self.stats.setReadOnly(True)
         self.stats.setMaximumHeight(135)
         self.body.addWidget(self.stats)
+        self.screening_group = QGroupBox("Automatic image screening · per training run")
+        screening_layout = QVBoxLayout(self.screening_group)
+        self.screening_heading = QLabel("")
+        self.screening_heading.setTextFormat(Qt.TextFormat.PlainText)
+        self.screening_heading.setWordWrap(True)
+        screening_layout.addWidget(self.screening_heading)
+        self.screening_output = QPlainTextEdit()
+        self.screening_output.setReadOnly(True)
+        self.screening_output.setMaximumHeight(160)
+        screening_layout.addWidget(self.screening_output)
+        self.screening_group.hide()
+        self.body.addWidget(self.screening_group)
         self.output = QTextEdit()
         self.output.setReadOnly(True)
         self.body.addWidget(self.output, 1)
@@ -500,11 +519,21 @@ class TrainingDialog(WorkDialog):
         except Exception as exc:
             self.readiness.setText("")
             self.stats.setPlainText(str(exc))
+        if not self.evaluate and not self.busy:
+            self._refresh_screening(previous=True)
+
+    def _append_output(self, text: str) -> None:
+        # Filenames and quality errors are data, never Qt rich text.
+        cursor = self.output.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        cursor.insertText(str(text) + "\n")
+        self.output.setTextCursor(cursor)
+        self.output.ensureCursorVisible()
 
     def _progress(self, percent: int, message: str) -> None:
         super()._progress(percent, message)
         if message:
-            self.output.append(message)
+            self._append_output(message)
 
     def start_job(self) -> None:
         view, backend = str(self.view.currentData()), str(self.backend.currentData())
@@ -522,8 +551,105 @@ class TrainingDialog(WorkDialog):
             self.refresh()
         self.output.clear()
         self.export.setEnabled(False)
+        if not self.evaluate:
+            self._begin_screening_attempt(view)
         operation = self.service.evaluate if self.evaluate else self.service.train
         self.run(lambda progress: operation(view, backend, progress), self.completed)
+
+    def _read_screening(self, view: str) -> dict | None:
+        getter = getattr(self.service, "training_screening", None)
+        if self.evaluate or not callable(getter):
+            return None
+        report = getter(view)
+        if not isinstance(report, dict) or not report:
+            return None
+        if report.get("view") not in (None, view):
+            raise ValueError("The saved screening report belongs to another housing view")
+        return report
+
+    def _begin_screening_attempt(self, view: str) -> None:
+        self._screening_run_before = None
+        self._screening_baseline_known = False
+        self._screening_requested_view = view
+        self._screening_attempt_active = True
+        self.screening_report = {}
+        try:
+            previous = self._read_screening(view)
+            self._screening_baseline_known = callable(getattr(self.service, "training_screening", None))
+            self._screening_run_before = str(previous["run_id"]) if previous and previous.get("run_id") else None
+        except Exception:
+            # A report read problem must not prevent a new training attempt.
+            pass
+        self.screening_output.clear()
+        self.screening_heading.setText("This training attempt: waiting for image screening.")
+        self.screening_group.setVisible(callable(getattr(self.service, "training_screening", None)))
+
+    def _refresh_screening(self, report: dict | None = None, *, previous: bool = False) -> None:
+        if self.evaluate:
+            return
+        provided_by_training_result = isinstance(report, dict) and bool(report)
+        try:
+            view = self._screening_requested_view if self._screening_attempt_active else str(self.view.currentData())
+            if not isinstance(report, dict) or not report:
+                report = self._read_screening(view)
+            elif report.get("view") not in (None, view):
+                raise ValueError("The training screening report belongs to another housing view")
+        except Exception as exc:
+            self.screening_group.show()
+            self.screening_heading.setText("Training screening report could not be loaded.")
+            self.screening_output.setPlainText(str(exc))
+            return
+        if not report:
+            self.screening_report = {}
+            if self._screening_attempt_active:
+                self.screening_group.show()
+                self.screening_heading.setText("No screening report is available for this training attempt.")
+                self.screening_output.setPlainText("No per-file exclusion counts have been reported. Review the training error and progress log below.")
+            else:
+                self.screening_group.hide()
+            return
+        self.screening_report = report
+        run_id = str(report.get("run_id", ""))
+        if previous or not self._screening_attempt_active:
+            scope = "Latest saved screening report · previous run"
+        elif run_id and run_id != self._screening_run_before and (self._screening_baseline_known or provided_by_training_result):
+            scope = "Screening report for this training attempt"
+        elif run_id and run_id == self._screening_run_before:
+            scope = "Previous run · this attempt has not produced a new screening report"
+        else:
+            scope = "Latest screening report · run identity could not be verified for this attempt"
+        self.screening_heading.setText(scope)
+        lines = [f"Run: {run_id or 'not reported'} · Status: {report.get('status', 'not reported')}",
+                 f"View: {report.get('view', view)} · Backend: {report.get('backend', 'not reported')}",
+                 f"Candidate images: {report.get('candidate_images', 'not reported')} · Accepted: {report.get('accepted_images', 'not reported')} · Excluded: {report.get('excluded_images', 'not reported')}",
+                 "Original files and labels are retained. Exclusions apply only to this training run."]
+        excluded = report.get("excluded", [])
+        if isinstance(excluded, list) and excluded:
+            lines.append("Excluded files:")
+            for entry in excluded:
+                if not isinstance(entry, dict):
+                    continue
+                filename = entry.get("filename") or entry.get("path") or entry.get("sample_id") or "Unnamed sample"
+                lines.append(f"- {filename} · Part: {entry.get('part_id', 'not reported')} · Stage: {entry.get('stage', 'not reported')}")
+                if entry.get("path"):
+                    lines.append("  File: " + str(entry["path"]))
+                reasons = entry.get("reasons", [])
+                lines.append("  Reasons: " + ("; ".join(map(str, reasons)) if isinstance(reasons, list) else str(reasons)))
+                if entry.get("metrics"):
+                    lines.append("  Measured quality: " + json_text(entry["metrics"]))
+        if report.get("error"):
+            lines.append("Run error: " + str(report["error"]))
+        if report.get("report_path"):
+            lines.append("Report path: " + str(report["report_path"]))
+        lines.append("Review excluded photos and recapture unfit images before a later training run.")
+        self.screening_output.setPlainText("\n".join(lines))
+        self.screening_group.show()
+
+    def _failed(self, message: str) -> None:
+        if not self.evaluate:
+            self._refresh_screening()
+            self._append_output("Training failed: " + message)
+        super()._failed(message)
 
     def _can_edit_settings(self) -> bool:
         return (not hasattr(self.service, "technician_configured") or
@@ -533,11 +659,12 @@ class TrainingDialog(WorkDialog):
         allowed = self._can_edit_settings()
         for control in self._training_controls:
             control.setEnabled(allowed and not self.busy)
-        if not allowed and not self.evaluate:
+        if not allowed and not self.evaluate and not self.footer.text():
             self.footer.setText("Operator mode: training uses saved settings. Unlock Technician Access on the dashboard to change commissioning settings.")
 
     def _finished(self) -> None:
         super()._finished()
+        self._screening_attempt_active = False
         self._apply_technician_restrictions()
 
     def start_benchmark(self) -> None:
@@ -551,7 +678,9 @@ class TrainingDialog(WorkDialog):
 
     def completed(self, report: dict) -> None:
         self.report = report
-        self.output.append(json_text(report))
+        self._append_output(json_text(report))
+        if not self.evaluate:
+            self._refresh_screening(report.get("training_screening"))
         self.export.setEnabled(True)
         self.footer.setText("Evaluation completed. Review sample counts, coverage and false rejects before selecting this model." if self.evaluate else "Training completed and model artifacts saved. Review independent validation before using this model.")
 
