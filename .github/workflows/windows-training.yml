@@ -39,6 +39,9 @@ jobs:
           --junitxml=windows-path-tests.xml
       - name: Start and render the actual interface
         run: python app.py --smoke-test
+      - name: Publish readable test failures
+        if: failure()
+        run: python scripts/report-test-failures.py windows-path-tests.xml
       - name: Retain test results
         if: always()
         uses: actions/upload-artifact@v4
