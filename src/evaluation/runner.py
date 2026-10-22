@@ -13,6 +13,8 @@ import cv2
 import numpy as np
 
 from src.data import DatasetIntegrityError, Sample
+from src.artifacts import atomic_json
+from src.utils.filesystem import display_path, filesystem_path
 from .calibration import wilson_interval
 
 
@@ -249,16 +251,13 @@ def evaluate_samples(samples: Iterable[Sample], inspect: Callable[[np.ndarray, s
 
 def export_report(report: dict[str, Any], directory: str | Path) -> dict[str, str]:
     """Export all outcomes including RECHECK to JSON and image/part CSV files."""
-    folder = Path(directory)
+    folder = filesystem_path(directory)
     folder.mkdir(parents=True, exist_ok=True)
-    result = {"json": str(folder / "evaluation.json"),
-              "images_csv": str(folder / "images.csv"), "parts_csv": str(folder / "parts.csv")}
-    target = Path(result["json"])
-    temporary = target.with_suffix(".json.tmp")
-    temporary.write_text(json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
-    temporary.replace(target)
+    result = {"json": display_path(folder / "evaluation.json"),
+              "images_csv": display_path(folder / "images.csv"), "parts_csv": display_path(folder / "parts.csv")}
+    atomic_json(folder / "evaluation.json", report)
     for key, records in (("images_csv", report.get("records", [])), ("parts_csv", report.get("part_records", []))):
-        with Path(result[key]).open("w", newline="", encoding="utf-8-sig") as stream:
+        with filesystem_path(result[key]).open("w", newline="", encoding="utf-8-sig") as stream:
             columns = list(dict.fromkeys(column for record in records for column in record))
             if columns:
                 writer = csv.DictWriter(stream, fieldnames=columns)

@@ -21,6 +21,7 @@ import uuid
 
 import cv2
 import numpy as np
+from src.utils.filesystem import display_path, filesystem_path
 
 VIEWS = ("inner_face", "ribbed_face", "side_left", "side_right")
 EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
@@ -46,7 +47,7 @@ class Sample:
         return str(self.metadata.get("session_id", ""))
 
     def to_dict(self) -> dict[str, Any]:
-        return {"id": self.id, "path": str(self.path), "label": self.label,
+        return {"id": self.id, "path": display_path(self.path), "label": self.label,
                 "view": self.view, "part_id": self.part_id, "sha256": self.sha256,
                 "metadata": self.metadata}
 
@@ -90,6 +91,7 @@ def _publish_new(staged: Path, target: Path) -> None:
     support on FAT/exFAT and network shares. POSIX rename would replace a file,
     so use an exclusive hard link there. Callers clean up remaining staging links.
     """
+    staged, target = filesystem_path(staged), filesystem_path(target)
     if _WINDOWS:
         os.rename(staged, target)
     else:
@@ -98,6 +100,7 @@ def _publish_new(staged: Path, target: Path) -> None:
 
 def _atomic_bytes(path: Path, payload: bytes, *, replace: bool = False) -> None:
     """Publish only a closed, fsynced file; never expose a partial final JSON."""
+    path = filesystem_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".metadata-{uuid.uuid4().hex}.tmp")
     created = False
@@ -139,28 +142,38 @@ def _slug(value: str, maximum: int, fallback: str) -> str:
     return re.sub(r"[^A-Za-z0-9_-]+", "-", value).strip("-_")[:maximum] or fallback
 
 
+def _canonical_path(path: str | Path) -> Path:
+    """Resolve links using an OS-usable path, then restore Windows long-path form."""
+    return filesystem_path(filesystem_path(path).resolve())
+
+
 class DatasetStore:
     _root_locks: dict[str, Any] = {}
     _root_locks_guard = threading.Lock()
 
     def __init__(self, root: str | Path):
-        self.root = Path(root).resolve()
+        self.root = _canonical_path(root)
         self.root.mkdir(parents=True, exist_ok=True)
         with self._root_locks_guard:
             self._lock = self._root_locks.setdefault(os.path.normcase(str(self.root)), threading.RLock())
 
     def _internal(self, path: Path) -> bool:
-        return not path.is_symlink() and path.resolve().is_relative_to(self.root)
+        path = filesystem_path(path)
+        return not path.is_symlink() and _canonical_path(path).is_relative_to(self.root)
 
     @staticmethod
     def _sidecar(path: Path) -> Path:
+        path = filesystem_path(path)
         return path.with_suffix(path.suffix + ".json")
 
+    def _relative(self, path: Path) -> Path:
+        return _canonical_path(path).relative_to(self.root)
+
     def _mirror(self, path: Path) -> Path:
-        relative = path.relative_to(self.root).as_posix()
+        relative = self._relative(path).as_posix()
         key = hashlib.sha256(relative.encode("utf-8")).hexdigest()
         mirror = self.root / ".metadata" / (key + ".json")
-        if not mirror.resolve().is_relative_to(self.root) or mirror.is_symlink():
+        if not _canonical_path(mirror).is_relative_to(self.root) or mirror.is_symlink():
             raise DatasetIntegrityError("Metadata recovery directory/file uses an unsafe path")
         return mirror
 
@@ -168,72 +181,73 @@ class DatasetStore:
         for path in sorted(self.root.glob("*/*/*")):
             if path.is_file() and path.suffix.lower() in EXTENSIONS and path.parent.name in ("GOOD", "NG") and not path.parent.parent.name.startswith("."):
                 if not self._internal(path):
-                    raise DatasetIntegrityError(f"Dataset image uses an unsafe external/symlink path: {path}")
+                    raise DatasetIntegrityError(f"Dataset image uses an unsafe external/symlink path: {display_path(path)}")
                 yield path, path.parent.parent.name, path.parent.name
         for folder in ("GOOD", "NG"):
             for path in sorted((self.root / folder).glob("*")):
                 if path.is_file() and path.suffix.lower() in EXTENSIONS:
                     if not self._internal(path):
-                        raise DatasetIntegrityError(f"Dataset image uses an unsafe external/symlink path: {path}")
+                        raise DatasetIntegrityError(f"Dataset image uses an unsafe external/symlink path: {display_path(path)}")
                     yield path, None, folder
 
     def _validate_details(self, details: Any, path: Path, view: str | None,
                           folder: str, digest: str) -> dict[str, Any]:
         if not isinstance(details, dict):
-            raise _MetadataRepairNeeded(f"Invalid provenance metadata: {self._sidecar(path)}: expected a JSON object")
+            raise _MetadataRepairNeeded(f"Invalid provenance metadata: {display_path(self._sidecar(path))}: expected a JSON object")
         # Any available contradictory evidence remains fatal, even in an incomplete file.
         claimed_hash = details.get("sha256")
         if isinstance(claimed_hash, str) and re.fullmatch(r"[a-f0-9]{64}", claimed_hash) and claimed_hash != digest:
-            raise DatasetIntegrityError(f"Image bytes differ from immutable sidecar: {path}")
+            raise DatasetIntegrityError(f"Image bytes differ from immutable sidecar: {display_path(path)}")
         if view is not None and details.get("view") is not None and details["view"] != view:
-            raise DatasetIntegrityError(f"Image view differs from immutable sidecar: {path}")
+            raise DatasetIntegrityError(f"Image view differs from immutable sidecar: {display_path(path)}")
         label = details.get("label")
         if label in (0, 1, "GOOD", "NG") and (0 if label in (0, "GOOD") else 1) != (0 if folder == "GOOD" else 1):
-            raise DatasetIntegrityError(f"Image label differs from immutable sidecar: {path}")
+            raise DatasetIntegrityError(f"Image label differs from immutable sidecar: {display_path(path)}")
         if details.get("schema_version", 1) != 1:
-            raise DatasetIntegrityError(f"Unsupported provenance schema: {path}")
+            raise DatasetIntegrityError(f"Unsupported provenance schema: {display_path(path)}")
         required = ("schema_version", "id", "view", "label", "part_id", "sha256")
         if any(key not in details for key in required):
-            raise _MetadataRepairNeeded(f"Invalid provenance metadata: {self._sidecar(path)}: missing required identity fields; repair with explicit physical part ID")
+            raise _MetadataRepairNeeded(f"Invalid provenance metadata: {display_path(self._sidecar(path))}: missing required identity fields; repair with explicit physical part ID")
         try:
             numeric = _validate_identity(details["view"], details["label"], details["part_id"])
         except (TypeError, ValueError) as exc:
-            raise _MetadataRepairNeeded(f"Invalid provenance metadata: {self._sidecar(path)}: {exc}") from exc
+            raise _MetadataRepairNeeded(f"Invalid provenance metadata: {display_path(self._sidecar(path))}: {exc}") from exc
         if numeric != details["label"] or not isinstance(details["id"], str) or not re.fullmatch(r"[A-Za-z0-9_-]+", details["id"]):
-            raise _MetadataRepairNeeded(f"Invalid provenance metadata: {self._sidecar(path)}: invalid sample ID or numeric label")
+            raise _MetadataRepairNeeded(f"Invalid provenance metadata: {display_path(self._sidecar(path))}: invalid sample ID or numeric label")
         if not isinstance(claimed_hash, str) or not re.fullmatch(r"[a-f0-9]{64}", claimed_hash):
-            raise _MetadataRepairNeeded(f"Invalid provenance metadata: {self._sidecar(path)}: invalid source hash")
+            raise _MetadataRepairNeeded(f"Invalid provenance metadata: {display_path(self._sidecar(path))}: invalid source hash")
         if view is None:
-            raise _MetadataRepairNeeded(f"Legacy image needs explicit view registration: {path}")
+            raise _MetadataRepairNeeded(f"Legacy image needs explicit view registration: {display_path(path)}")
         return details
 
     def _archive_sidecar(self, path: Path, original: bytes, digest: str,
                          selection: dict[str, Any] | None = None) -> Path:
         backup = self.root / ".metadata" / "repairs" / (uuid.uuid4().hex + ".sidecar.bin")
-        if not backup.resolve().is_relative_to(self.root):
+        if not _canonical_path(backup).is_relative_to(self.root):
             raise DatasetIntegrityError("Metadata repair backup directory uses an unsafe path")
         _atomic_bytes(backup, original)
         _atomic_bytes(backup.with_suffix(".json"), _json_bytes({
-            "schema_version": 1, "original_image": str(path), "image_sha256": digest,
-            "original_sidecar": str(self._sidecar(path)), "sidecar_sha256": _hash(original),
+            "schema_version": 1, "original_image": display_path(path), "image_sha256": digest,
+            "original_sidecar": display_path(self._sidecar(path)), "sidecar_sha256": _hash(original),
             "saved_at": datetime.now(timezone.utc).isoformat(), "selection": selection}))
         return backup
 
     def _details(self, path: Path, view: str | None, folder: str) -> tuple[dict[str, Any], bytes]:
+        path = filesystem_path(path)
         data = path.read_bytes()
         digest = _hash(data)
         sidecar = self._sidecar(path)
         if sidecar.is_symlink():
-            raise DatasetIntegrityError(f"Metadata sidecar uses an unsafe symbolic link: {sidecar}")
+            raise DatasetIntegrityError(f"Metadata sidecar uses an unsafe symbolic link: {display_path(sidecar)}")
         original = sidecar.read_bytes() if sidecar.exists() else None
         error = None
         try:
             if original is None:
-                raise _MetadataRepairNeeded(f"Missing metadata/physical part ID: {path}. Import using Dataset Manager with explicit IDs.")
+                raise _MetadataRepairNeeded(f"Missing metadata/physical part ID: {display_path(path)}. Import using Dataset Manager with explicit IDs.")
             try:
                 parsed = json.loads(original.decode("utf-8-sig"))
             except (UnicodeError, json.JSONDecodeError) as exc:
-                raise _MetadataRepairNeeded(f"Invalid provenance metadata: {sidecar}: {exc}; repair with explicit physical part ID") from exc
+                raise _MetadataRepairNeeded(f"Invalid provenance metadata: {display_path(sidecar)}: {exc}; repair with explicit physical part ID") from exc
             details = self._validate_details(parsed, path, view, folder, digest)
         except _MetadataRepairNeeded as exc:
             error = exc
@@ -243,30 +257,31 @@ class DatasetStore:
             try:
                 wrapper = json.loads(mirror.read_text(encoding="utf-8-sig"))
                 recovered = wrapper["metadata"]
-                if (wrapper["schema_version"] != 1 or wrapper["relative_path"] != path.relative_to(self.root).as_posix()
+                if (wrapper["schema_version"] != 1 or wrapper["relative_path"] != self._relative(path).as_posix()
                         or wrapper["image_sha256"] != digest or wrapper["metadata_sha256"] != _hash(_json_bytes(recovered))):
                     raise ValueError("recovery mirror path, image hash or metadata checksum mismatch")
                 recovered = self._validate_details(recovered, path, view, folder, digest)
             except (KeyError, TypeError, ValueError, UnicodeError) as exc:
-                raise DatasetIntegrityError(f"Untrusted/corrupt metadata recovery mirror: {mirror}: {exc}") from exc
+                raise DatasetIntegrityError(f"Untrusted/corrupt metadata recovery mirror: {display_path(mirror)}: {exc}") from exc
             if details is None:
                 if original is not None:
                     self._archive_sidecar(path, original, digest)
                 _atomic_bytes(sidecar, _json_bytes(recovered), replace=original is not None)
                 details = recovered
             elif _json_bytes(details) != _json_bytes(recovered):
-                raise DatasetIntegrityError(f"Provenance identity differs from immutable metadata recovery mirror: {path}")
+                raise DatasetIntegrityError(f"Provenance identity differs from immutable metadata recovery mirror: {display_path(path)}")
         if details is None:
             raise error
-        _decode(data, str(path))
+        _decode(data, display_path(path))
         return details, data
 
     def import_image(self, path: str | Path, view: str, label: str | int,
                      part_id: str, session_id: str = "", *,
                      metadata: dict[str, Any] | None = None) -> Sample:
-        source = Path(path).absolute()
+        source = filesystem_path(path)
         if source.is_symlink():
             raise DatasetIntegrityError("Select an original image, not a symbolic link")
+        source = _canonical_path(source)
         if source.suffix.lower() not in EXTENSIONS:
             raise ValueError(f"Unsupported image extension: {source.suffix}")
         _validate_identity(view, label, part_id)
@@ -279,12 +294,15 @@ class DatasetStore:
                 except _MetadataRepairNeeded:
                     return self.repair_image(source, view, label, part_id, session_id, metadata=metadata)
             return self._store(source.read_bytes(), source.suffix.lower(), view, label,
-                               part_id, session_id, str(source.resolve()), metadata, source_path=source)
+                               part_id, session_id, display_path(source), metadata, source_path=source)
 
     def repair_image(self, path: str | Path, view: str, label: str | int,
                      part_id: str, session_id: str = "", *,
                      metadata: dict[str, Any] | None = None) -> Sample:
-        source = Path(path).absolute()
+        source = filesystem_path(path)
+        if source.is_symlink():
+            raise DatasetIntegrityError("Select an original image, not a symbolic link")
+        source = _canonical_path(source)
         numeric = _validate_identity(view, label, part_id)
         if not self._internal(source) or source.suffix.lower() not in EXTENSIONS:
             raise DatasetIntegrityError("Metadata repair requires an original image inside this dataset")
@@ -301,17 +319,17 @@ class DatasetStore:
             else:
                 # Intact or safely recovered records cannot be relabelled by repair.
                 return self._store(source.read_bytes(), source.suffix.lower(), view, label,
-                                   part_id, session_id, str(source.resolve()), metadata, source_path=source)
+                                   part_id, session_id, display_path(source), metadata, source_path=source)
             data = source.read_bytes()
-            _decode(data, str(source))
+            _decode(data, display_path(source))
             broken = sidecar.read_bytes()
             selection = {"view": view, "label": numeric, "part_id": part_id.strip(), "session_id": str(session_id)}
             self._check_partial_identity(broken, selection)
             backup = self._archive_sidecar(source, broken, _hash(data), selection)
-            extra = {**(metadata or {}), "repaired_from": str(source),
-                     "metadata_repair_backup": str(backup.relative_to(self.root))}
+            extra = {**(metadata or {}), "repaired_from": display_path(source),
+                     "metadata_repair_backup": str(self._relative(backup))}
             return self._store(data, source.suffix.lower(), view, label, part_id, session_id,
-                               str(source.resolve()), extra, source_path=source,
+                               display_path(source), extra, source_path=source,
                                repair_sidecar_sha256=_hash(broken))
 
     @staticmethod
@@ -345,7 +363,10 @@ class DatasetStore:
 
     def _finish_source(self, source: Path | None, sample: Sample, digest: str,
                        repair_sidecar_sha256: str | None) -> None:
-        if source is None or not self._internal(source) or source.resolve() == sample.path.resolve():
+        if source is None:
+            return
+        source = filesystem_path(source)
+        if not self._internal(source) or _canonical_path(source) == _canonical_path(sample.path):
             return
         sidecar = self._sidecar(source)
         if sidecar.exists() and repair_sidecar_sha256 is None:
@@ -363,7 +384,7 @@ class DatasetStore:
                 sidecar.unlink()
         except (OSError, DatasetIntegrityError) as exc:
             raise DatasetIntegrityError(
-                f"Verified managed copy retained at {sample.path}, but the selected old source could not be cleaned up: {source}: {exc}. Close the file and retry registration; neither copy is overwritten.") from exc
+                f"Verified managed copy retained at {display_path(sample.path)}, but the selected old source could not be cleaned up: {display_path(source)}: {exc}. Close the file and retry registration; neither copy is overwritten.") from exc
 
     def _store(self, data: bytes, suffix: str, view: str, label: str | int,
                part_id: str, session_id: str, source: str,
@@ -380,7 +401,7 @@ class DatasetStore:
                     if rejection["sha256"] == digest:
                         raise DatasetIntegrityError("This exact duplicate image was rejected; importing or repairing it cannot silently restore it")
                 except (KeyError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
-                    raise DatasetIntegrityError(f"Invalid sample rejection record: {tombstone}") from exc
+                    raise DatasetIntegrityError(f"Invalid sample rejection record: {display_path(tombstone)}") from exc
             selection = {"part_id": part_id, "view": view, "label": numeric_label}
             for candidate, candidate_view, folder in self._paths():
                 sidecar = self._sidecar(candidate)
@@ -398,7 +419,7 @@ class DatasetStore:
                     return existing
             sample_id = uuid.uuid4().hex
             directory = self.root / view / ("GOOD" if numeric_label == 0 else "NG")
-            if not directory.resolve().is_relative_to(self.root):
+            if not _canonical_path(directory).is_relative_to(self.root):
                 raise DatasetIntegrityError("Selected dataset view directory uses an unsafe path")
             directory.mkdir(parents=True, exist_ok=True)
             name = "_".join((_slug(part_id, 24, "part"), _slug(view, 20, "view"),
@@ -427,7 +448,7 @@ class DatasetStore:
                     stream.write(data)
                     stream.flush()
                     os.fsync(stream.fileno())
-                wrapper = {"schema_version": 1, "relative_path": target.relative_to(self.root).as_posix(),
+                wrapper = {"schema_version": 1, "relative_path": self._relative(target).as_posix(),
                            "image_sha256": digest, "metadata_sha256": _hash(_json_bytes(details)),
                            "metadata": details}
                 _atomic_bytes(mirror, _json_bytes(wrapper))
@@ -481,7 +502,7 @@ class DatasetStore:
                                 details["part_id"].strip(), _hash(data), details)
                 prior = hashes.get(sample.sha256)
                 if prior and (prior.part_id, prior.label, prior.view) != (sample.part_id, sample.label, sample.view):
-                    raise DatasetIntegrityError(f"Duplicate bytes claim incompatible labels/physical parts/views: {prior.path}, {path}")
+                    raise DatasetIntegrityError(f"Duplicate bytes claim incompatible labels/physical parts/views: {display_path(prior.path)}, {display_path(path)}")
                 hashes[sample.sha256] = sample
                 if (include_rejected or not (self.root / ".rejected" / f"{sample_id}.json").exists()) and (view is None or candidate_view == view):
                     samples.append(sample)
@@ -498,7 +519,7 @@ class DatasetStore:
                     self._details(path, candidate_view, folder)
                 except _MetadataRepairNeeded as exc:
                     if view is None or candidate_view == view:
-                        pending.append({"path": str(path), "view": candidate_view, "label": folder,
+                        pending.append({"path": display_path(path), "view": candidate_view, "label": folder,
                                         "status": "repair_required" if self._sidecar(path).exists() else "unassigned",
                                         "reason": str(exc)})
             return pending

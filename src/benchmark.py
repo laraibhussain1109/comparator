@@ -16,6 +16,7 @@ from typing import Any, Iterable
 from src.artifacts import atomic_json
 from src.data import DatasetIntegrityError, Sample
 from src.evaluation import evaluate_samples, export_report
+from src.utils.filesystem import display_path, filesystem_path
 
 
 MODES = ("geometry", "efficientad", "hybrid")
@@ -82,7 +83,7 @@ def _prepare(service, pipelines: dict[str, Any]) -> tuple[list[Sample], dict[str
         test_parts.update(str(row["part_id"]) for row in split["test"])
         test_hashes.update(row["sha256"] for row in split["test"])
         versions[view] = meta.get("version")
-        artifacts[view] = str(getattr(pipeline, "directory", ""))
+        artifacts[view] = display_path(getattr(pipeline, "directory", ""))
     if test_parts & (training_parts | validation_parts) or test_hashes & (training_hashes | validation_hashes):
         raise DatasetIntegrityError("A held-out part or original image overlaps training/calibration in at least one active view model")
     # All rosters match, so one authoritative global manifest supplies every view.
@@ -139,8 +140,8 @@ def evaluate_all(service, backend: str, progress=None) -> dict[str, Any]:
                    "model_versions": provenance["model_versions"],
                    "artifact_paths": provenance["artifact_paths"],
                    "split_roster_sha256": provenance["split_roster_sha256"]})
-    output = Path(service.config["paths"]["results"]) / "evaluations" / uuid.uuid4().hex
-    report["report_path"] = str(output)
+    output = filesystem_path(service.config["paths"]["results"]) / "evaluations" / uuid.uuid4().hex
+    report["report_path"] = display_path(output)
     export_report(report, output)
     emit(100, "Evaluation completed", f"Actual complete-view outcomes saved to {output}")
     return report
@@ -191,7 +192,7 @@ def benchmark(service, view: str, progress=None) -> dict[str, Any]:
         if pipeline.metadata.get("backend") != "efficientad" or getattr(pipeline, "model", None) is None:
             raise ValueError(f"{selected} needs a genuine trained EfficientAD bundle for a paired three-mode benchmark")
     samples, provenance = _prepare(service, bases)
-    output = Path(service.config["paths"]["results"]) / "benchmarks" / uuid.uuid4().hex
+    output = filesystem_path(service.config["paths"]["results"]) / "benchmarks" / uuid.uuid4().hex
     reports = {}
     attempted = 0
     total = len(samples) * len(MODES)
@@ -220,7 +221,7 @@ def benchmark(service, view: str, progress=None) -> dict[str, Any]:
                        "split_roster_sha256": provenance["split_roster_sha256"],
                        "fixed_shared_calibration": True, "memory": _memory_finish(memory),
                        "score_note": "Hybrid AUROC describes the anomaly branch score; fused decisions are assessed by confusion metrics, coverage and RECHECK rates" if mode == "hybrid" else "Selected branch raw score",
-                       "report_path": str(output / mode)})
+                       "report_path": display_path(output / mode)})
         export_report(report, output / mode)
         reports[mode] = report
     summary = {"schema_version": 1, "scope": _scope(views, view == "all"),
@@ -232,7 +233,7 @@ def benchmark(service, view: str, progress=None) -> dict[str, Any]:
                "modes": reports, "winner": None,
                "selection_note": "No automatic winner: compare held-out GOOD false rejects, defect sensitivity, RECHECK coverage and measured latency together. These modes share conservative fixed calibration.",
                "optional_models": {"dinomaly": "Not integrated or evaluated", "dinov2": "Disabled; not benchmarked"},
-               "report_path": str(output),
+               "report_path": display_path(output),
                "warnings": ["Software benchmark output does not establish real housing accuracy or Windows camera acceptance"]}
     atomic_json(output / "benchmark.json", summary)
     emit(100, "Benchmark completed", f"Actual paired reports saved to {output}")

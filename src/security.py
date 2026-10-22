@@ -11,13 +11,14 @@ import os
 from pathlib import Path
 
 from src.artifacts import atomic_json
+from src.utils.filesystem import filesystem_path
 
 
 class TechnicianLock:
     ITERATIONS = 600_000
 
     def __init__(self, path: Path):
-        self.path = Path(path)
+        self.path = filesystem_path(path)
         self.unlocked = False
 
     @property

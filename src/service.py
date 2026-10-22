@@ -23,7 +23,8 @@ from src.inspection.evidence import EvidenceStore
 from src.inspection.session import InspectionSession, ViewDecision
 from src.inspection.view_pipeline import ViewPipeline
 from src.utils.config import deep_merge
-from src.utils.image_utils import read_image
+from src.utils.filesystem import display_path, filesystem_path
+from src.utils.image_utils import read_image, write_image
 from src.vision import FaceIdentifier, GeometryProfile, HousingLocator, LandmarkRegistrar, roi_mask, tile_image
 
 
@@ -32,7 +33,7 @@ MODES = {'geometry', 'efficientad', 'hybrid'}
 
 def _jsonable(value):
     if isinstance(value, Path):
-        return str(value)
+        return display_path(value)
     if isinstance(value, np.generic):
         return value.item()
     if isinstance(value, np.ndarray):
@@ -115,7 +116,7 @@ class NeuroIrisService:
         self.dataset.remove(sample_id)
 
     def _roi_path(self, view):
-        return Path(self.config['paths']['runtime']) / 'rois' / safe_name(self.config['product']) / (safe_name(view) + '.json')
+        return filesystem_path(self.config['paths']['runtime']) / 'rois' / safe_name(self.config['product']) / (safe_name(view) + '.json')
 
     def get_rois(self, view) -> list[dict]:
         path = self._roi_path(view)
@@ -160,7 +161,7 @@ class NeuroIrisService:
         tile = candidate['tiling']
         if int(tile['tile_size']) < 8 or not 0 <= float(tile['overlap']) < 1 or int(tile['batch_size']) < 1:
             raise ValueError('Invalid tile size, overlap or batch size')
-        path = Path(self.config['paths']['runtime']) / 'config-overrides.json'
+        path = filesystem_path(self.config['paths']['runtime']) / 'config-overrides.json'
         previous = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
         atomic_json(path, _jsonable(deep_merge(previous, settings)))
         self.config = candidate
@@ -321,7 +322,7 @@ class NeuroIrisService:
             decision = self.session.finalize()
             directory = self.evidence.save(self.session, self.frames, self.marked)
             self._saved_event_id = self.session.event_id
-            return {**decision.to_dict(), 'session': self._session_dict(), 'evidence_path': str(directory)}
+            return {**decision.to_dict(), 'session': self._session_dict(), 'evidence_path': display_path(directory)}
 
     def cancel_part(self):
         with self._operation_lock:
@@ -330,7 +331,7 @@ class NeuroIrisService:
             decision = self.session.cancel('Cancelled by operator; inspection coverage incomplete')
             directory = self.evidence.save(self.session, self.frames, self.marked)
             self._saved_event_id = self.session.event_id
-            return {**decision.to_dict(), 'session': self._session_dict(), 'evidence_path': str(directory)}
+            return {**decision.to_dict(), 'session': self._session_dict(), 'evidence_path': display_path(directory)}
 
     def history(self):
         return [{**row, 'verdict': (row.get('final_decision') or {}).get('verdict', 'RECHECK'),
@@ -366,7 +367,7 @@ class NeuroIrisService:
         atomic_json(directory / 'manifest.json', {**metadata, 'schema_version': 1, 'files': files})
 
     def _screening_directory(self, view):
-        return (Path(self.config['paths']['results']) / 'training_screening' /
+        return (filesystem_path(self.config['paths']['results']) / 'training_screening' /
                 safe_name(self.config['product']) / safe_name(view))
 
     def training_screening(self, view):
@@ -384,7 +385,7 @@ class NeuroIrisService:
                 bundled_path = directory / safe_name(pointer['version']) / 'training_screening.json'
                 bundled = json.loads(bundled_path.read_text(encoding='utf-8'))
                 if bundled.get('run_id') == report.get('run_id') and bundled.get('status') == 'completed':
-                    return {**bundled, 'report_path': str(bundled_path)}
+                    return {**bundled, 'report_path': display_path(bundled_path)}
             except (OSError, KeyError, TypeError, ValueError):
                 pass
         return report
@@ -414,7 +415,7 @@ class NeuroIrisService:
         def exclude(sample, stage, reasons, metrics):
             excluded_ids.add(sample.id)
             report['excluded'].append({'sample_id': sample.id, 'filename': sample.path.name,
-                                       'path': str(sample.path), 'part_id': sample.part_id,
+                                       'path': display_path(sample.path), 'part_id': sample.part_id,
                                        'view': sample.view, 'sha256': sample.sha256,
                                        'stage': stage, 'reasons': list(reasons), 'metrics': metrics})
             report['excluded_images'] = len(report['excluded'])
@@ -549,7 +550,7 @@ class NeuroIrisService:
                          'started_at': datetime.now(timezone.utc).isoformat(), 'status': 'screening',
                          'candidate_images': 0, 'accepted_images': 0, 'excluded_images': 0,
                          'candidate_sample_ids': [], 'accepted_sample_ids': [], 'excluded': [],
-                         'report_path': str(self._screening_directory(view) / (run_id + '.json'))}
+                         'report_path': display_path(self._screening_directory(view) / (run_id + '.json'))}
             self._save_training_screening(screening)
             try:
                 result = self._train(view, backend, progress, screening)
@@ -563,7 +564,7 @@ class NeuroIrisService:
             except OSError as exc:
                 # Publication has succeeded. Preserve its successful outcome and
                 # point the user at the already-written, verified bundle report.
-                screening['report_path'] = str(Path(result['artifact_path']) / 'training_screening.json')
+                screening['report_path'] = display_path(Path(result['artifact_path']) / 'training_screening.json')
                 result['warnings'].append(
                     f'Model saved successfully; the external screening report could not be finalized: {exc}. '
                     f'The completed report is retained in the model bundle: {screening["report_path"]}')
@@ -618,8 +619,7 @@ class NeuroIrisService:
                     'limitations': ['No real housing accuracy or camera validation is implied by software training',
                                     'GOOD-only calibration cannot establish defect recall' if not any(s.label for s in selected['validation']) else 'Pilot targets require measured held-out acceptance']}
         with self.artifacts.staging(view) as stage:
-            if not cv2.imwrite(str(stage / 'template.png'), template):
-                raise OSError('Could not save registration template')
+            write_image(stage / 'template.png', template)
             geometry.save(stage / 'geometry.npz')
             if backend == 'efficientad':
                 from src.models.efficientad import EfficientADBackend
@@ -650,7 +650,7 @@ class NeuroIrisService:
                 else:
                     invalid_validation.append({'sample_id': sample.id, 'part_id': sample.part_id,
                                                'filename': sample.path.name, 'view': sample.view,
-                                               'path': str(sample.path), 'reasons': data.reasons})
+                                               'path': display_path(sample.path), 'reasons': data.reasons})
             screening['invalid_validation_captures'] = invalid_validation
             self._save_training_screening(screening)
             ng_part_ids = {s.part_id for s in samples if s.label == 1}
@@ -708,13 +708,13 @@ class NeuroIrisService:
             target = self.artifacts.publish(stage, metadata)
             self._pipelines.clear()
             emit(100, 'Training completed', f'Persisted model bundle {target.name}; held-out report saved')
-            return {**summary, 'artifact_path': str(target)}
+            return {**summary, 'artifact_path': display_path(target)}
 
     @staticmethod
     def _saved_samples(rows):
         result = []
         for row in rows:
-            path = Path(row['path'])
+            path = filesystem_path(row['path'])
             if not path.is_file() or digest(path) != row['sha256']:
                 raise ValueError(f'Original held-out sample missing or modified: {path}')
             result.append(Sample(row['id'], path, int(row['label']), row['view'], row['part_id'], row['sha256'], row.get('metadata', {})))
@@ -739,11 +739,11 @@ class NeuroIrisService:
                                       score_key='geometry_score' if backend == 'geometry' else 'anomaly_score')
             report.update({'scope': f'Single-view {view}; final production sessions require all mandatory views',
                            'model_version': meta['version'], 'backend': backend})
-            output = Path(self.config['paths']['results']) / 'evaluations' / (uuid.uuid4().hex)
+            output = filesystem_path(self.config['paths']['results']) / 'evaluations' / (uuid.uuid4().hex)
             export_report(report, output)
             if progress:
                 progress(100, 'Evaluation completed', f'Actual outcomes saved to {output}')
-            return {**report, 'report_path': str(output)}
+            return {**report, 'report_path': display_path(output)}
 
     def benchmark(self, view, progress=None):
         from src.benchmark import benchmark

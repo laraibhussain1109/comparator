@@ -20,6 +20,7 @@ import cv2
 import numpy as np
 
 from src.models.weights import ModelSetupError, natural_image_paths, sha256_file, teacher_weights
+from src.utils.filesystem import filesystem_path
 
 log = logging.getLogger(__name__)
 ANOMALIB_VERSION = "2.2.0"
@@ -190,7 +191,8 @@ class EfficientADBackend:
         # Seed before construction so student/autoencoder initialization is repeatable.
         self._build()
         try:
-            state = torch.load(teacher_path, map_location="cpu", weights_only=True)
+            with open(filesystem_path(teacher_path), "rb") as teacher_file:
+                state = torch.load(teacher_file, map_location="cpu", weights_only=True)
             self.model.teacher.load_state_dict(state, strict=True)
         except (OSError, RuntimeError, ValueError, TypeError, pickle.UnpicklingError) as error:
             raise ModelSetupError(f"Verified teacher checkpoint is incompatible with selected EfficientAD model: {error}") from error
@@ -221,7 +223,7 @@ class EfficientADBackend:
                     order = random.permutation(len(good_images))
                 image = good_images[int(order[step % len(good_images)])]
                 path = natural_paths[int(random.integers(len(natural_paths)))]
-                with Image.open(path) as natural:
+                with open(filesystem_path(path), "rb") as natural_file, Image.open(natural_file) as natural:
                     penalty = natural_transform(natural.convert("RGB")).unsqueeze(0).to(self.device)
                 optimizer.zero_grad(set_to_none=True)
                 losses = self.model(self._tensor([image]), batch_imagenet=penalty)
@@ -271,29 +273,34 @@ class EfficientADBackend:
         if not self.trained or self.model is None:
             raise ModelSetupError("No trained EfficientAD model is available to save.")
         directory = Path(directory)
-        directory.mkdir(parents=True, exist_ok=True)
+        Path(filesystem_path(directory)).mkdir(parents=True, exist_ok=True)
         checkpoint = directory / "efficientad.pt"
-        temporary = directory / "efficientad.pt.part"
+        temporary = directory / ".ea.pt.tmp"
         # Tensor-only state; loading never deserializes model/class pickles.
         state = {key: value.detach().cpu() for key, value in self.model.state_dict().items()}
-        self._torch.save(state, temporary)
-        os.replace(temporary, checkpoint)
+        # Python opens the extended Windows path; PyTorch only sees a stream,
+        # avoiding its native filename writer and legacy MAX_PATH handling.
+        with open(filesystem_path(temporary), "wb") as checkpoint_file:
+            self._torch.save(state, checkpoint_file)
+        os.replace(filesystem_path(temporary), filesystem_path(checkpoint))
         self.metadata["checkpoint_sha256"] = sha256_file(checkpoint)
         self.metadata["model_version"] = f"efficientad-anomalib{ANOMALIB_VERSION}-{self.metadata['checkpoint_sha256'][:12]}"
         manifest = directory / "model.json"
-        pending = manifest.with_suffix(".json.part")
-        pending.write_text(json.dumps(self.metadata, indent=2), encoding="utf-8")
-        os.replace(pending, manifest)
+        pending = directory / ".ea.json.tmp"
+        with open(filesystem_path(pending), "w", encoding="utf-8") as manifest_file:
+            json.dump(self.metadata, manifest_file, indent=2)
+        os.replace(filesystem_path(pending), filesystem_path(manifest))
 
     def load(self, directory: Path) -> "EfficientADBackend":
         directory = Path(directory)
         manifest = directory / "model.json"
         checkpoint = directory / "efficientad.pt"
         self._trained = False
-        if not manifest.is_file() or not checkpoint.is_file():
+        if not Path(filesystem_path(manifest)).is_file() or not Path(filesystem_path(checkpoint)).is_file():
             raise ModelSetupError(f"Trained EfficientAD artifact is incomplete at {directory}; train the view model first.")
         try:
-            info = json.loads(manifest.read_text(encoding="utf-8"))
+            with open(filesystem_path(manifest), "r", encoding="utf-8") as manifest_file:
+                info = json.load(manifest_file)
         except (OSError, ValueError) as error:
             raise ModelSetupError(f"Invalid EfficientAD model manifest: {error}") from error
         if info.get("artifact_version") != ARTIFACT_VERSION or info.get("anomalib_version") != ANOMALIB_VERSION:
@@ -308,7 +315,8 @@ class EfficientADBackend:
         self._validate_settings()
         self._build()
         try:
-            state = self._torch.load(checkpoint, map_location="cpu", weights_only=True)
+            with open(filesystem_path(checkpoint), "rb") as checkpoint_file:
+                state = self._torch.load(checkpoint_file, map_location="cpu", weights_only=True)
             self.model.load_state_dict(state, strict=True)
         except (OSError, RuntimeError, ValueError, TypeError, pickle.UnpicklingError) as error:
             raise ModelSetupError(f"Cannot load trained EfficientAD tensor checkpoint: {error}") from error

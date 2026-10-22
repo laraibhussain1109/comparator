@@ -12,12 +12,16 @@ import pytest
 
 import src.data.dataset as dataset_module
 from src.data import DatasetIntegrityError, DatasetStore
+from src.utils.filesystem import display_path, filesystem_path
 
 
 def photo(path: Path, seed: int = 1) -> bytes:
+    path = filesystem_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     image = np.random.default_rng(seed).integers(0, 256, (64, 96, 3), dtype=np.uint8)
-    assert cv2.imwrite(str(path), image)
+    success, encoded = cv2.imencode(path.suffix, image)
+    assert success
+    path.write_bytes(encoded.tobytes())
     return path.read_bytes()
 
 
@@ -65,7 +69,7 @@ def test_unselected_raw_remains_pending_ui_tolerates_but_training_is_strict(tmp_
     stats = store.stats()
     assert stats["images"] == stats["parts"] == 1
     assert stats["unmanaged_count"] == 1
-    assert stats["unmanaged_images"][0]["path"] == str(second)
+    assert stats["unmanaged_images"][0]["path"] == display_path(second)
     assert stats["unmanaged_images"][0]["status"] == "unassigned"
     assert second.read_bytes() == original
     with pytest.raises(DatasetIntegrityError, match="Missing metadata/physical part ID"):
@@ -125,7 +129,7 @@ def test_atomic_sidecar_failure_preserves_source_and_removes_only_created_files(
         store.import_image(source, "inner_face", "GOOD", "Lemon", "oct")
     assert source.read_bytes() == original
     assert store.inventory(strict=False) == []
-    assert store.unmanaged_images()[0]["path"] == str(source)
+    assert store.unmanaged_images()[0]["path"] == display_path(source)
     assert not list((store.root / ".metadata").glob("*.json"))
     assert not list(store.root.rglob("*.tmp"))
 
@@ -272,9 +276,9 @@ def test_image_is_published_only_after_complete_metadata_and_root_locks_are_shar
     assert another._lock is store._lock
     source = tmp_path / "source.jpg"
     photo(source)
-    real_link = dataset_module.os.link
+    real_publish = dataset_module._publish_new
     observed = []
-    def link_after_metadata(source_path, target, *args, **kwargs):
+    def publish_after_metadata(source_path, target):
         target = Path(target)
         if target.suffix.lower() == ".jpg":
             assert not target.exists()
@@ -282,8 +286,8 @@ def test_image_is_published_only_after_complete_metadata_and_root_locks_are_shar
             wrapper = json.loads(store._mirror(target).read_text())
             assert wrapper["metadata"] == details
             observed.append(target)
-        return real_link(source_path, target, *args, **kwargs)
-    monkeypatch.setattr(dataset_module.os, "link", link_after_metadata)
+        return real_publish(source_path, target)
+    monkeypatch.setattr(dataset_module, "_publish_new", publish_after_metadata)
     sample = store.import_image(source, "inner_face", "GOOD", "Lemon", "oct")
     assert observed == [sample.path]
     assert another.inventory() == [sample]

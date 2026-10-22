@@ -16,6 +16,7 @@ import cv2
 import numpy as np
 
 from src.inspection.session import InspectionSession
+from src.utils.filesystem import display_path, filesystem_path
 
 
 def _jsonable(value: Any) -> Any:
@@ -24,7 +25,7 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, np.generic):
         return _jsonable(value.item())
     if isinstance(value, Path):
-        return str(value)
+        return display_path(value)
     if isinstance(value, dict):
         return {str(k): _jsonable(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
@@ -49,7 +50,7 @@ def _validate_frame(frame: np.ndarray) -> None:
 
 
 def _write_file(path: Path, payload: bytes) -> None:
-    with path.open("xb") as handle:
+    with filesystem_path(path).open("xb") as handle:
         handle.write(payload)
         handle.flush()
         os.fsync(handle.fileno())
@@ -57,7 +58,7 @@ def _write_file(path: Path, payload: bytes) -> None:
 
 class EvidenceStore:
     def __init__(self, root: str | Path):
-        self.root = Path(root)
+        self.root = filesystem_path(root)
         self.root.mkdir(parents=True, exist_ok=True)
 
     def save(self, session: InspectionSession, frames: dict[str, np.ndarray],
@@ -154,7 +155,7 @@ class EvidenceStore:
 
     def read(self, folder: str | Path) -> dict[str, Any]:
         """Read an actual stored event and verify JSON, file and pixel integrity."""
-        folder = Path(folder)
+        folder = filesystem_path(folder)
         event_file = folder / "event.json"
         raw = event_file.read_bytes()
         expected = (folder / "event.sha256").read_text("ascii").strip()
@@ -201,7 +202,7 @@ class EvidenceStore:
                 if _frame_digest(frame) != metadata["pixel_sha256"]:
                     raise ValueError(f"Evidence pixel integrity check failed: {view}/{variant}")
         event["integrity_verified"] = True
-        event["evidence_path"] = str(folder)
+        event["evidence_path"] = display_path(folder)
         return event
 
     def history(self) -> list[dict[str, Any]]:
@@ -217,6 +218,6 @@ class EvidenceStore:
             try:
                 events.append(self.read(folder))
             except (OSError, ValueError, KeyError, TypeError) as exc:
-                events.append({"event_id": folder.name, "evidence_path": str(folder),
+                events.append({"event_id": folder.name, "evidence_path": display_path(folder),
                                "integrity_verified": False, "storage_error": str(exc)})
         return sorted(events, key=lambda row: row.get("created_at", ""), reverse=True)

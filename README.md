@@ -64,6 +64,8 @@ The training screen lists **GOOD/NG image counts separately from eligible physic
 
 ## Repair missing or damaged image metadata
 
+Report and model files are created automatically. Windows paths in nested installation folders and folders with non-ASCII names are supported through the filesystem layer; temporary report filenames stay short. An earlier version appended an extra UUID to the destination filename and could hit Windows' legacy path limit before the report was created. Update the application while keeping your existing dataset; do not create empty reports or JSON metadata files manually.
+
 If training reports `Invalid provenance metadata ... .jpg.json: Expecting value`, update to the latest `codex/neuroiris-inspection-system` branch and keep your existing `dataset` directory. Do not delete photographs or create empty JSON files to bypass the error.
 
 Open **DATASET MANAGER**. Unregistered images and damaged metadata appear as **Needs Registration** / **Needs Repair**, so they no longer prevent opening the manager. Select the affected images of **one physical housing**, choose the correct view/GOOD or NG label, enter its actual physical part ID and capture session, and click **Register / Repair Selected**. Repeat for different housings with their own real IDs, then train again.

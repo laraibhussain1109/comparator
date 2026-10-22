@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QTextEdit, QVBoxLayout, QWidget)
 
 from src.ui.neuroiris import BACKEND_LABELS, VIEW_LABELS, ImageCanvas, TaskWorker, json_text
+from src.utils.filesystem import filesystem_path
 
 
 def add_views(combo: QComboBox, selected: str = "inner_face") -> None:
@@ -49,7 +50,10 @@ def decimal(value: float, minimum: float, maximum: float, decimals: int = 3) -> 
 
 def read_image(path: str) -> np.ndarray | None:
     try:
-        return cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
+        # Python's Unicode/extended-path filesystem boundary avoids native
+        # NumPy filename readers that still encounter Windows MAX_PATH limits.
+        data = np.frombuffer(filesystem_path(path).read_bytes(), dtype=np.uint8)
+        return cv2.imdecode(data, cv2.IMREAD_COLOR)
     except (OSError, cv2.error):
         return None
 
@@ -62,7 +66,7 @@ def export_json(parent: QWidget, value: Any, filename: str) -> None:
     path, _ = QFileDialog.getSaveFileName(parent, "Export report", filename, "JSON (*.json)")
     if path:
         try:
-            Path(path).write_text(json_text(value), encoding="utf-8")
+            filesystem_path(path).write_text(json_text(value), encoding="utf-8")
         except OSError as exc:
             error(parent, exc)
 
@@ -907,7 +911,7 @@ class HistoryDialog(QDialog):
         path, _ = QFileDialog.getSaveFileName(self, "Export finalized part history", "neuroiris-history.csv", "CSV (*.csv)")
         if path:
             try:
-                with Path(path).open("w", newline="", encoding="utf-8-sig") as handle:
+                with filesystem_path(path).open("w", newline="", encoding="utf-8-sig") as handle:
                     writer = csv.DictWriter(handle, fieldnames=["part_id", "verdict", "timestamp", "reasons", "missing_views", "record"])
                     writer.writeheader()
                     for row in self.rows:

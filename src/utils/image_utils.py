@@ -3,15 +3,36 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from src.utils.filesystem import display_path, filesystem_path
+
 EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 
-def read_image(path: Path) -> np.ndarray:
-    data = np.fromfile(path, dtype=np.uint8)
-    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+def read_image(path: str | Path) -> np.ndarray:
+    """Decode bytes read by Python, including Unicode and extended Windows paths."""
+    with filesystem_path(path).open("rb") as handle:
+        data = np.frombuffer(handle.read(), dtype=np.uint8)
+    try:
+        image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    except cv2.error as exc:
+        raise ValueError(f"Unreadable image: {display_path(path)}") from exc
     if image is None:
-        raise ValueError(f"Unreadable image: {path}")
+        raise ValueError(f"Unreadable image: {display_path(path)}")
     return image
+
+
+def write_image(path: str | Path, image: np.ndarray) -> None:
+    """Encode in memory and write with Python's long-path-capable filesystem API."""
+    destination = filesystem_path(path)
+    try:
+        success, encoded = cv2.imencode(destination.suffix.lower(), image)
+    except cv2.error as exc:
+        raise OSError(f"Could not encode image: {display_path(destination)}") from exc
+    if not success:
+        raise OSError(f"Could not encode image: {display_path(destination)}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("wb") as handle:
+        handle.write(encoded.tobytes())
 
 
 def normalize_illumination(image: np.ndarray) -> np.ndarray:

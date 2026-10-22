@@ -10,12 +10,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 import json
+import os
+from uuid import uuid4
 
 import cv2
 import numpy as np
 
 from .housing import HousingLocator, PartPose, hole_landmarks
 from .roi import roi_mask
+from src.utils.filesystem import filesystem_path
 
 
 @dataclass
@@ -399,24 +402,32 @@ class GeometryProfile:
     def save(self, path: str | Path) -> None:
         if self.structure is None:
             raise ValueError("Cannot save an unfitted geometry profile")
-        path = Path(path)
+        path = filesystem_path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         metadata = {"version": self.VERSION, "view": self.view, "settings": self.settings,
                     "shape": self.shape, "center": self.center, "radius": self.radius,
                     "angle_bins": self.angle_bins, "radial_bins": self.radial_bins,
                     "training_count": self.training_count, "holes": self.holes,
                     "circle_statistics": self.circle_statistics}
-        temporary = path.with_name(path.name + ".tmp")
-        with temporary.open("wb") as handle:
-            np.savez_compressed(handle, metadata=np.array(json.dumps(metadata)), keep_mask=self.keep_mask,
-                                allowed_mask=self.allowed_mask,
-                                structure=self.structure, structure_mad=self.structure_mad,
-                                rim=self.rim, rim_mad=self.rim_mad, mounting_edges=self.mounting_edges)
-        temporary.replace(path)
+        temporary = path.with_name(f".geometry-{uuid4().hex}.tmp")
+        created = False
+        try:
+            with temporary.open("xb") as handle:
+                created = True
+                np.savez_compressed(handle, metadata=np.array(json.dumps(metadata)), keep_mask=self.keep_mask,
+                                    allowed_mask=self.allowed_mask,
+                                    structure=self.structure, structure_mad=self.structure_mad,
+                                    rim=self.rim, rim_mad=self.rim_mad, mounting_edges=self.mounting_edges)
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(path)
+        finally:
+            if created:
+                temporary.unlink(missing_ok=True)
 
     @classmethod
     def load(cls, path: str | Path) -> "GeometryProfile":
-        with np.load(Path(path), allow_pickle=False) as archive:
+        with filesystem_path(path).open("rb") as handle, np.load(handle, allow_pickle=False) as archive:
             metadata = json.loads(str(archive["metadata"]))
             if metadata["version"] != cls.VERSION:
                 raise ValueError("Unsupported geometry profile version")

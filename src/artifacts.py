@@ -11,6 +11,8 @@ import re
 import shutil
 import uuid
 
+from src.utils.filesystem import display_path, filesystem_path
+
 
 def safe_name(value: str) -> str:
     if not value or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,99}', value) or value in {'.', '..'}:
@@ -20,28 +22,34 @@ def safe_name(value: str) -> str:
 
 def digest(path: Path) -> str:
     checksum = hashlib.sha256()
-    with path.open('rb') as handle:
+    with filesystem_path(path).open('rb') as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b''):
             checksum.update(chunk)
     return checksum.hexdigest()
 
 
 def atomic_json(path: Path, value: object) -> None:
+    path = filesystem_path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f'.{path.name}.{uuid.uuid4().hex}.tmp')
+    # Independent of the destination's basename: appending two UUIDs pushed the
+    # reported Windows staging path to MAX_PATH even though the final file fit.
+    temporary = path.with_name(f'.{uuid.uuid4().hex}.tmp')
+    created = False
     try:
-        with temporary.open('w', encoding='utf-8') as handle:
+        with temporary.open('x', encoding='utf-8') as handle:
+            created = True
             json.dump(value, handle, indent=2, allow_nan=False, default=str)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(temporary, path)
     finally:
-        temporary.unlink(missing_ok=True)
+        if created:
+            temporary.unlink(missing_ok=True)
 
 
 class ArtifactStore:
     def __init__(self, root: Path, product: str):
-        self.root = Path(root) / safe_name(product)
+        self.root = filesystem_path(root) / safe_name(product)
 
     @contextmanager
     def staging(self, view: str):
@@ -57,6 +65,7 @@ class ArtifactStore:
 
     def publish(self, staging: Path, metadata: dict) -> Path:
         """Only a fully written bundle becomes active; an earlier model stays intact."""
+        staging = filesystem_path(staging)
         version = safe_name(metadata.get('version') or (datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S') + '-' + uuid.uuid4().hex[:8]))
         metadata = {**metadata, 'schema_version': 1, 'version': version,
                     'created_at': datetime.now(timezone.utc).isoformat()}
@@ -74,6 +83,7 @@ class ArtifactStore:
 
     @staticmethod
     def verify(directory: Path) -> dict:
+        directory = filesystem_path(directory)
         manifest = json.loads((directory / 'manifest.json').read_text(encoding='utf-8'))
         if manifest.get('schema_version') != 1 or not manifest.get('files'):
             raise ValueError('Unsupported or incomplete model bundle')
@@ -106,7 +116,7 @@ class ArtifactStore:
         for path in sorted(self.root.glob('*/*/manifest.json'), reverse=True):
             try:
                 meta = self.verify(path.parent)
-                result.append({**meta, 'path': str(path.parent), 'status': 'integrity verified'})
+                result.append({**meta, 'path': display_path(path.parent), 'status': 'integrity verified'})
             except (OSError, ValueError, KeyError) as exc:
-                result.append({'path': str(path.parent), 'status': 'invalid', 'error': str(exc)})
+                result.append({'path': display_path(path.parent), 'status': 'invalid', 'error': str(exc)})
         return result

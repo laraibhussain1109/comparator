@@ -1,12 +1,14 @@
 """Opt-in actual-network integration. Synthetic housings do not validate accuracy."""
 from __future__ import annotations
 import os
+import shutil
 from pathlib import Path
 import cv2
 import pytest
 
 from src.artifacts import ArtifactStore
 from src.data import split_by_part
+from src.utils.filesystem import filesystem_path
 
 from test_smoke_training import make_service, import_housings
 from test_vision import housing
@@ -16,11 +18,28 @@ from test_vision import housing
 def test_actual_neural_service_train_reload_tiling_calibration_evaluation(tmp_path):
     import torch
     torch.set_num_threads(2)
-    service = make_service(tmp_path)
+    base = tmp_path
+    while len(str(base)) < 285:
+        base /= 'NeuroIris_铝件_परीक्षण_' + str(len(base.parts))
+    base = filesystem_path(base)
+    base.mkdir(parents=True, exist_ok=True)
+    # Exercise real teacher reads, natural-photo reads and tensor checkpoint
+    # writes beyond MAX_PATH as well as the reporting/geometry path.
+    teacher_cache = base / 'verified teacher cache 预训练'
+    natural_folder = base / 'natural photographs 自然图像'
+    teacher_cache.mkdir()
+    natural_folder.mkdir()
+    for name in ('pretrained_teacher_small.pth', 'pretrained_teacher_small.integrity.json'):
+        shutil.copyfile(filesystem_path(Path(os.environ['NEUROIRIS_TEACHER_CACHE']) / name),
+                        teacher_cache / name)
+    source_photo = next(path for path in filesystem_path(os.environ['NEUROIRIS_NATURAL_IMAGE_DIR']).rglob('*')
+                        if path.is_file() and path.suffix.lower() in {'.png', '.jpg', '.jpeg'})
+    shutil.copyfile(source_photo, natural_folder / source_photo.name)
+    service = make_service(base)
     service.config['models']['efficientad'].update({
         'max_steps': 1, 'input_size': 512, 'device': 'cpu',
-        'teacher_cache': os.environ['NEUROIRIS_TEACHER_CACHE'],
-        'imagenet_dir': os.environ['NEUROIRIS_NATURAL_IMAGE_DIR'],
+        'teacher_cache': str(teacher_cache),
+        'imagenet_dir': str(natural_folder),
         'allow_download': False, 'download_imagenette': False,
     })
     import_housings(service)
@@ -38,7 +57,7 @@ def test_actual_neural_service_train_reload_tiling_calibration_evaluation(tmp_pa
     metadata = ArtifactStore.verify(Path(summary['artifact_path']))
     assert blurred['id'] not in metadata['training_accepted_sample_ids']
     assert {row['id'] for row in metadata['split']['train']} == {s.id for s in split.train} | {blurred['id']}
-    assert Path(summary['artifact_path'], 'neural').is_dir()
+    assert (filesystem_path(summary['artifact_path']) / 'neural').is_dir()
     assert summary['test']['count'] >= 1
     assert all(row['error'] is None for row in summary['report']['records'])
     service._pipelines.clear()
