@@ -85,6 +85,24 @@ recursively. The default directory is
 `artifacts/pretrained/imagenette2/train`. Aluminium GOOD images and held-out
 inspection test images must not be substituted for this dataset.
 
+Enable the Imagenette checkbox while Technician Access is unlocked, then click
+**Train & Save Versioned Model** to save the setting and start the download.
+The training log shows bytes received, automatic connection retries, checksum
+verification and extraction. An interrupted HTTPS transfer is retried up to five
+times; retries resume the received bytes when the server supports HTTP Range.
+Certificate verification remains enabled and the archive is used only after its
+published SHA256 matches.
+
+`SSL: DECRYPTION_FAILED_OR_BAD_RECORD_MAC` means the encrypted connection failed;
+it does not mean the official URL is missing. If retries still fail, download
+<https://s3.amazonaws.com/fast-ai-imageclas/imagenette2.tgz> in a browser and save
+it as `artifacts/pretrained/imagenette2.tgz` inside the project folder (with the
+default teacher cache). Leave the Imagenette download option enabled and start
+training again. The app verifies the cached archive and extracts it automatically.
+You do not need to create JSON files or unpack the archive manually. An app
+restart or a new training attempt starts a new transfer if no verified archive
+was saved; resuming applies to retries within the same attempt.
+
 A custom teacher requires both `teacher_path` and its matching `teacher_sha256`.
 That digest establishes local integrity; the adapter labels its provenance as
 user supplied rather than claiming it matches a published official checkpoint.

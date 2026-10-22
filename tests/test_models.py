@@ -87,6 +87,44 @@ def test_invalid_images_fail_before_optional_dependencies(tmp_path):
         EfficientADBackend().fit([], tmp_path)
 
 
+def test_asset_download_progress_reaches_training_observer(tmp_path, monkeypatch):
+    """Large asset transfers stay visible before optional neural construction."""
+    import src.models.efficientad as efficientad
+
+    natural_messages = ["Downloading Imagenette: 12 MiB", "Retrying interrupted Imagenette download",
+                        "Extracting Imagenette training photographs"]
+    teacher_messages = ["Using verified pretrained teacher cache"]
+
+    def natural_images(settings, *, progress=None):
+        assert progress is not None
+        for message in natural_messages:
+            progress(message)
+        return [tmp_path / "natural.jpg"]
+
+    def teacher(settings, *, progress=None):
+        assert progress is not None
+        for message in teacher_messages:
+            progress(message)
+        return tmp_path / "teacher.pth", {"sha256": "a" * 64}
+
+    def stop_before_neural_construction():
+        raise ModelSetupError("neural construction intentionally not exercised")
+
+    monkeypatch.setattr(efficientad, "natural_image_paths", natural_images)
+    monkeypatch.setattr(efficientad, "teacher_weights", teacher)
+    monkeypatch.setattr(efficientad, "_dependencies", stop_before_neural_construction)
+    updates = []
+    backend = EfficientADBackend()
+    with pytest.raises(ModelSetupError, match="intentionally not exercised"):
+        backend.fit([np.zeros((256, 256, 3), np.uint8)], tmp_path / "model",
+                    progress=lambda percent, message: updates.append((percent, message)))
+    forwarded = [message for _, message in updates[1:]]
+    assert forwarded == natural_messages + teacher_messages
+    assert all(0 <= percent < 5 for percent, _ in updates)
+    assert not backend.trained
+    assert not (tmp_path / "model").exists()
+
+
 @pytest.mark.skipif(not os.environ.get("NEUROIRIS_REAL_EFFICIENTAD_SMOKE"),
                     reason="Opt-in actual EfficientAD training smoke needs verified pretrained assets and natural photographs.")
 def test_actual_efficientad_optimizer_and_checkpoint_roundtrip(tmp_path):

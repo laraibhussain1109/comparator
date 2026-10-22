@@ -182,8 +182,8 @@ class EfficientADBackend:
         self.metadata = {}
         self._validate_settings()
         emit(1, "Checking real pretrained teacher and natural-image penalty dataset")
-        natural_paths = natural_image_paths(self.settings)
-        teacher_path, provenance = teacher_weights(self.settings)
+        natural_paths = natural_image_paths(self.settings, progress=lambda message: emit(1, message))
+        teacher_path, provenance = teacher_weights(self.settings, progress=lambda message: emit(3, message))
         torch, _, _ = _dependencies()
         torch.manual_seed(int(self.settings["seed"]))
         if torch.cuda.is_available():

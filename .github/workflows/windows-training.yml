@@ -37,6 +37,8 @@ jobs:
           tests/test_dataset_long_paths.py
           tests/test_dataset_import.py
           tests/test_model_file_io.py
+          tests/test_asset_downloads.py
+          tests/test_models.py
           tests/test_smoke_training.py
           --junitxml=windows-path-tests.xml
       - name: Start and render the actual interface

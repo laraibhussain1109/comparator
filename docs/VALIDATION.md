@@ -54,3 +54,35 @@ The reported screening temporary path measured 260 UTF-16 units, exceeding the l
 **Native Windows validation passed:** [Windows training file IO, run 39731647811](https://github.com/laraibhussain1109/comparator/actions/runs/39731647811), on commit `fad4cd0`. The Windows runner installed the real CPU PyTorch package and passed the selected path/import/config/image/checkpoint/training tests, followed by `python app.py --smoke-test`. These include final file paths beyond 260 characters, Unicode folders, automatic report creation, geometry training/publication/reload/evaluation, source preservation, and safe tensor checkpoint roundtrips. Native testing exposed a second issue with relative paths from an already-extended working directory; its fix and regression tests are included.
 
 The full Linux neural-enabled suite passed **238 tests in 92.10 seconds**, without skips. Its genuine EfficientAD service workflow now places configuration, dataset, teacher cache, natural photographs, report files and model checkpoints under a deep Unicode root. It completes real optimizer execution, checkpoint reload, calibration, evaluation and paired benchmarking. After the native Windows relative-path correction, the focused path/config/training suite passed **24 tests** locally and the native Windows workflow passed. Tests use software housing fixtures and CPU execution; these results do not establish industrial defect accuracy or validate physical camera/GPU hardware.
+
+## Interrupted Imagenette HTTPS downloads
+
+The configured official fastai URL was checked against its source README and
+the live S3 server. A complete download of `imagenette2.tgz` using the application
+downloader received **1,557,161,267 bytes**, matched the published SHA256, and
+automatically extracted **9,469 training photographs**. The checksum and dataset
+were verified in the Linux cloud environment; the user's Windows TLS connection
+was not available for direct reproduction.
+
+The downloader now retries transient connection failures up to five times with
+bounded backoff, resumes private temporary files using validated HTTP Range
+responses, and safely restarts if a server ignores Range. Transfer, retry,
+verification and extraction messages reach the training observer. Certificate
+verification and final SHA256 verification remain required. Certificate errors,
+missing URLs, malformed ranges, invalid checksums and local write errors are not
+silently treated as successful downloads. The training guide includes a browser
+download fallback to the same verified archive cache.
+
+The full suite passed **260 tests, with 2 opt-in neural tests skipped**, in
+41.12 seconds. Those two genuine EfficientAD tests were then executed separately
+with the verified teacher and the newly downloaded Imagenette photographs:
+**2 passed in 52.17 seconds**, including service training, reload, calibration,
+evaluation and benchmarking under deep Unicode paths. The focused asset/model
+suite passed **32 tests, with 2 optional tests skipped**, in the lightweight
+environment. These checks include the screenshot's exact SSL failure after a
+partial transfer, successful Range resumption, ignored and malformed ranges,
+premature EOF, retry limits, HTTP/certificate rejection, disk errors, checksum
+protection, offline cache reuse and training-progress forwarding. The offscreen
+application startup smoke test passed. Windows CI now includes these asset
+regressions; this validation does not claim to repair a persistent fault in the
+user's network or TLS installation.
