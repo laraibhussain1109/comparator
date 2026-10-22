@@ -49,6 +49,16 @@ def test_non_windows_paths_keep_normal_path_semantics(tmp_path, monkeypatch):
     assert filesystem.filesystem_path(path) == path
 
 
+@pytest.mark.parametrize("absolute", [
+    r"\\?\C:\inspection\铝件\configuration.yaml",
+    r"\\?\UNC\inspection-server\share\configuration.yaml",
+])
+def test_relative_path_from_extended_windows_working_directory_is_not_prefixed_twice(monkeypatch, absolute):
+    monkeypatch.setattr(filesystem, "WINDOWS", True)
+    monkeypatch.setattr(filesystem.ntpath, "abspath", lambda value: absolute)
+    assert str(filesystem.filesystem_path("configuration.yaml")) == absolute
+
+
 @pytest.mark.parametrize("source, expected", [
     (r"\\?\C:\inspection\latest.json", r"C:\inspection\latest.json"),
     (r"\\?\UNC\inspection-server\share\latest.json", r"\\inspection-server\share\latest.json"),

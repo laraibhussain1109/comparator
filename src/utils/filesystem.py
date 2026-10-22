@@ -26,6 +26,10 @@ def filesystem_path(value: str | os.PathLike[str]) -> Path:
     if text.startswith('\\\\?\\'):
         return Path(text)
     absolute = ntpath.normpath(ntpath.abspath(text))
+    # Windows can return an extended path for a relative input when the current
+    # working directory is already extended. It is not an ordinary UNC share.
+    if absolute.startswith('\\\\?\\'):
+        return Path(absolute)
     if absolute.startswith('\\\\'):
         return Path('\\\\?\\UNC\\' + absolute[2:])
     return Path('\\\\?\\' + absolute)
