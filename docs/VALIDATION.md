@@ -86,3 +86,28 @@ protection, offline cache reuse and training-progress forwarding. The offscreen
 application startup smoke test passed. Windows CI now includes these asset
 regressions; this validation does not claim to repair a persistent fault in the
 user's network or TLS installation.
+
+## Automatic Imagenette preparation
+
+Missing natural-image data now triggers official Imagenette preparation during
+EfficientAD training, including configurations that retain the obsolete
+`download_imagenette: false` setting. The training dialog shows an informational
+notice instead of a download checkbox, so operator training does not need
+technician access to prepare the dataset. Extraction follows `imagenet_dir`,
+including custom paths, and subsequent calls reuse the photographs.
+
+The full pinned neural-enabled suite passed **273 tests in 95.33 seconds**,
+without skips, including genuine EfficientAD optimizer/checkpoint execution and
+the service train/reload/calibration/evaluation workflow. The focused automatic
+preparation and UI suite passed **33 tests**. Regressions cover default directory
+creation, missing/legacy false settings, locked and unlocked training, offline
+reuse, custom cache/image paths, archive filtering, and failed downloads without
+substituting housing images. The previous-model preservation test now injects a
+fitting failure explicitly, instead of relying on missing natural assets to
+stop training.
+
+A separate check used the actual checksum-verified 1,557,161,267-byte archive,
+an empty custom image directory and the legacy false setting. It automatically
+extracted all **9,469 training photographs**, then reused them with network access
+disabled. The application also passed its offscreen startup smoke test. Windows
+CI includes the new automatic preparation and operator UI regressions.

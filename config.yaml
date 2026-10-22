@@ -34,7 +34,6 @@ models:
     teacher_path: null
     imagenet_dir: null
     allow_download: true
-    download_imagenette: false
     mixed_precision: false
 registration:
   min_confidence: 0.55

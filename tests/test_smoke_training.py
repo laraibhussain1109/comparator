@@ -7,6 +7,7 @@ import pytest
 import yaml
 
 from src.service import NeuroIrisService
+from src.models import EfficientADBackend, ModelSetupError
 from src.utils.config import load_config
 from src.artifacts import ArtifactStore
 from test_vision import housing
@@ -62,13 +63,19 @@ def test_grouped_geometry_train_restart_inspect_and_blind_evaluate(tmp_path):
     assert report['parts']['recall'] is None
 
 
-def test_failed_training_keeps_previous_model_and_roi_change_requires_retrain(tmp_path):
+def test_failed_training_keeps_previous_model_and_roi_change_requires_retrain(tmp_path, monkeypatch):
     service = make_service(tmp_path)
     import_housings(service)
     summary = service.train('ribbed_face', 'geometry')
     before = service.artifacts.active('ribbed_face', 'geometry')
-    with pytest.raises((RuntimeError, ValueError, ImportError)):
-        service.train('ribbed_face', 'efficientad')  # no neural dependencies/natural assets in base environment
+    def fail_fit(*args, **kwargs):
+        raise ModelSetupError('Controlled neural fitting failure')
+
+    # Missing assets now trigger automatic setup, so exercise a later fitting
+    # failure explicitly without depending on network access or installed torch.
+    monkeypatch.setattr(EfficientADBackend, 'fit', fail_fit)
+    with pytest.raises(ModelSetupError, match='Controlled neural fitting failure'):
+        service.train('ribbed_face', 'efficientad')
     assert service.artifacts.active('ribbed_face', 'geometry') == before
     service.save_rois('ribbed_face', [{'shape': 'circle', 'points': [[.5, .5], [.6, .5]], 'exclusion': True}])
     outcome, _, _ = service._infer(housing(), 'ribbed_face', 'geometry')

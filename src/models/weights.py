@@ -245,9 +245,10 @@ def _image_paths(root: Path) -> list[Path]:
 def natural_image_paths(settings: dict, *, progress: Callable[[str], None] | None = None) -> list[Path]:
     """Find genuine natural images for EfficientAD's required penalty term.
 
-    This never reuses aluminium GOOD images as an ImageNet substitute. The user
-    may provide an ImageNet/ImageNette folder. Downloading the official ~1.5 GB
-    ImageNette archive is explicit because it is a substantial prerequisite.
+    Use the configured natural-image folder when populated. Otherwise download
+    and verify official Imagenette automatically, including installations with
+    the obsolete download_imagenette setting disabled. Aluminium GOOD images
+    are never used as a replacement for this required penalty dataset.
     """
     root = Path(settings.get("imagenet_dir") or "artifacts/pretrained/imagenette2/train").expanduser()
     emit = progress or (lambda _: None)
@@ -255,16 +256,9 @@ def natural_image_paths(settings: dict, *, progress: Callable[[str], None] | Non
     if paths:
         emit(f"Using {len(paths)} cached natural photographs from {root}")
         return paths
-    if not settings.get("download_imagenette", False):
-        raise ModelSetupError(
-            f"EfficientAD requires a natural-image penalty dataset, absent at {root}. "
-            "Set imagenet_dir to genuine ImageNet/ImageNette training photographs, "
-            "or enable download_imagenette (official archive about 1.5 GB). "
-            "GOOD housing images are not a replacement for this dataset."
-        )
+    emit(f"Natural-image dataset missing at {root}; preparing official Imagenette automatically (~1.5 GB)")
     cache = Path(settings.get("teacher_cache") or "artifacts/pretrained/efficientad").expanduser().parent
     archive = verified_download(IMAGENETTE_URL, cache / "imagenette2.tgz", IMAGENETTE_SHA256, progress=progress)
-    extracted = cache / "imagenette2"
     emit("Extracting verified Imagenette training photographs")
     count = 0
     with open(filesystem_path(archive), "rb") as archive_file, tarfile.open(fileobj=archive_file, mode="r:gz") as source:
@@ -274,7 +268,7 @@ def natural_image_paths(settings: dict, *, progress: Callable[[str], None] | Non
             if (not member.isfile() or len(parts) < 4 or parts[0:2] != ("imagenette2", "train")
                     or ".." in parts or Path(member.name).suffix.lower() not in IMAGE_SUFFIXES):
                 continue
-            output = cache.joinpath(*parts)
+            output = root.joinpath(*parts[2:])
             Path(filesystem_path(output.parent)).mkdir(parents=True, exist_ok=True)
             stream = source.extractfile(member)
             if stream is not None:
@@ -283,7 +277,7 @@ def natural_image_paths(settings: dict, *, progress: Callable[[str], None] | Non
                 count += 1
                 if count % 500 == 0:
                     emit(f"Extracting Imagenette: {count} training photographs")
-    paths = _image_paths(extracted / "train")
+    paths = _image_paths(root)
     if not paths:
         raise ModelSetupError("The verified ImageNette archive contains no usable training photographs.")
     emit(f"Imagenette ready: {len(paths)} training photographs")

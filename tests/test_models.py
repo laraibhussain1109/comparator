@@ -46,12 +46,22 @@ def test_unsupported_models_and_invalid_native_batch():
         EfficientADBackend({"mixed_precision": True})
 
 
-def test_required_natural_images_not_silently_replaced(tmp_path):
-    with pytest.raises(ModelSetupError, match="natural-image penalty dataset"):
+def test_required_natural_images_not_silently_replaced(tmp_path, monkeypatch):
+    from src.models import weights
+
+    attempts = []
+
+    def unavailable_download(url, path, expected_sha256, *, progress=None):
+        attempts.append((url, expected_sha256))
+        raise ModelSetupError("Natural-image download failed in test")
+
+    monkeypatch.setattr(weights, "verified_download", unavailable_download)
+    with pytest.raises(ModelSetupError, match="download failed"):
         natural_image_paths({"imagenet_dir": str(tmp_path), "download_imagenette": False})
     image = np.zeros((256, 256, 3), np.uint8)
-    with pytest.raises(ModelSetupError, match="natural-image penalty dataset"):
+    with pytest.raises(ModelSetupError, match="download failed"):
         EfficientADBackend({"imagenet_dir": str(tmp_path)}).fit([image], tmp_path / "output")
+    assert attempts == [(weights.IMAGENETTE_URL, weights.IMAGENETTE_SHA256)] * 2
     assert not (tmp_path / "output" / "model.json").exists()
 
 

@@ -78,15 +78,18 @@ Network settings may need to allow GitHub's release-asset redirect as well as
 `github.com`; ImageNette uses `s3.amazonaws.com`.
 
 EfficientAD also needs genuine natural photographs for its ImageNet penalty.
-In **Train Model**, set the ImageNet / ImageNette directory to an existing
-natural-image training folder, or enable **Download official Imagenette if
-missing**. The official download is about 1.5 GB and is opt-in. Images are found
-recursively. The default directory is
+In **Train Model**, missing natural-image data triggers automatic download,
+verification and extraction of official Imagenette (about 1.5 GB) when training
+starts. This works in operator mode, without unlocking Technician Access or
+enabling a checkbox. An existing genuine ImageNet/ImageNette training folder can
+also be configured. Images are found recursively. The default directory is
 `artifacts/pretrained/imagenette2/train`. Aluminium GOOD images and held-out
 inspection test images must not be substituted for this dataset.
 
-Enable the Imagenette checkbox while Technician Access is unlocked, then click
-**Train & Save Versioned Model** to save the setting and start the download.
+Click **Train & Save Versioned Model** to start training and prepare any missing
+natural-image data automatically. Existing saved `download_imagenette: false`
+settings no longer block this download. Extracted photographs are saved in the
+configured ImageNet / Imagenette directory and reused for later training.
 The training log shows bytes received, automatic connection retries, checksum
 verification and extraction. An interrupted HTTPS transfer is retried up to five
 times; retries resume the received bytes when the server supports HTTP Range.
@@ -97,8 +100,8 @@ published SHA256 matches.
 it does not mean the official URL is missing. If retries still fail, download
 <https://s3.amazonaws.com/fast-ai-imageclas/imagenette2.tgz> in a browser and save
 it as `artifacts/pretrained/imagenette2.tgz` inside the project folder (with the
-default teacher cache). Leave the Imagenette download option enabled and start
-training again. The app verifies the cached archive and extracts it automatically.
+default teacher cache), then start training again. The app verifies the cached
+archive and extracts it automatically.
 You do not need to create JSON files or unpack the archive manually. An app
 restart or a new training attempt starts a new transfer if no verified archive
 was saved; resuming applies to retries within the same attempt.
@@ -134,7 +137,6 @@ mixed_precision: false
 teacher_cache: artifacts/pretrained/efficientad
 allow_download: true
 imagenet_dir: artifacts/pretrained/imagenette2/train
-download_imagenette: false
 ```
 
 Anomalib EfficientAD requires training batch size **one**. Inference batching is

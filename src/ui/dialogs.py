@@ -421,8 +421,8 @@ class TrainingDialog(WorkDialog):
         self.teacher_cache = QLineEdit(str(neural.get("teacher_cache", "artifacts/pretrained/efficientad")))
         self.download_teacher = QCheckBox("Allow official checksum-verified teacher download (~40 MB)")
         self.download_teacher.setChecked(bool(neural.get("allow_download", False)))
-        self.download_imagenette = QCheckBox("Download official Imagenette if missing (~1.5 GB)")
-        self.download_imagenette.setChecked(bool(neural.get("download_imagenette", False)))
+        self.imagenette_status = QLabel("Imagenette downloads automatically when needed for training (~1.5 GB). Downloaded images are reused.")
+        self.imagenette_status.setWordWrap(True)
         self.learning_rate = decimal(float(neural.get("learning_rate", .0001)), .000001, .1, 6)
         self.tile = spin(int(service.config.get("tiling", {}).get("tile_size", 512)), 64, 4096)
         self.overlap = decimal(float(service.config.get("tiling", {}).get("overlap", .25)), 0, .75, 2)
@@ -439,7 +439,7 @@ class TrainingDialog(WorkDialog):
             form.addRow("Genuine ImageNet / Imagenette directory", self.imagenet)
             form.addRow("Teacher cache directory", self.teacher_cache)
             form.addRow(self.download_teacher)
-            form.addRow(self.download_imagenette)
+            form.addRow(self.imagenette_status)
             form.addRow("Learning rate", self.learning_rate)
             form.addRow("Tile edge (native pixels)", self.tile)
             form.addRow("Tile overlap fraction", self.overlap)
@@ -499,12 +499,12 @@ class TrainingDialog(WorkDialog):
         self.export.clicked.connect(lambda: export_json(self, self.report, "neuroiris-evaluation.json" if self.evaluate else "neuroiris-training.json"))
         row.addWidget(self.export)
         self.body.addLayout(row)
-        self._locked = [self.start, self.view, self.backend, self.steps, self.batch, self.input_size, self.imagenet, self.teacher_cache, self.download_teacher, self.download_imagenette, self.learning_rate,
+        self._locked = [self.start, self.view, self.backend, self.steps, self.batch, self.input_size, self.imagenet, self.teacher_cache, self.download_teacher, self.learning_rate,
                         self.tile, self.overlap, self.validation, self.test_fraction, self.group_sessions]
         if self.benchmark_button is not None:
             self._locked.append(self.benchmark_button)
         self._training_controls = [self.steps, self.batch, self.input_size, self.imagenet, self.teacher_cache,
-            self.download_teacher, self.download_imagenette, self.learning_rate, self.tile, self.overlap,
+            self.download_teacher, self.learning_rate, self.tile, self.overlap,
             self.validation, self.test_fraction, self.group_sessions]
         self.finish_layout()
         self._apply_technician_restrictions()
@@ -546,7 +546,7 @@ class TrainingDialog(WorkDialog):
                 error(self, "Keep sufficient physical parts for training. Validation plus test fractions must be below 0.8.")
                 return
             try:
-                self.service.configure({"models": {"efficientad": {"max_steps": self.steps.value(), "train_batch_size": 1, "inference_batch_size": self.batch.value(), "input_size": self.input_size.value(), "learning_rate": self.learning_rate.value(), "imagenet_dir": self.imagenet.text().strip(), "teacher_cache": self.teacher_cache.text().strip(), "allow_download": self.download_teacher.isChecked(), "download_imagenette": self.download_imagenette.isChecked()}},
+                self.service.configure({"models": {"efficientad": {"max_steps": self.steps.value(), "train_batch_size": 1, "inference_batch_size": self.batch.value(), "input_size": self.input_size.value(), "learning_rate": self.learning_rate.value(), "imagenet_dir": self.imagenet.text().strip(), "teacher_cache": self.teacher_cache.text().strip(), "allow_download": self.download_teacher.isChecked()}},
                     "tiling": {"tile_size": self.tile.value(), "overlap": self.overlap.value()},
                     "dataset": {"split": [1 - self.validation.value() - self.test_fraction.value(), self.validation.value(), self.test_fraction.value()], "group_sessions": self.group_sessions.isChecked()}})
             except Exception as exc:

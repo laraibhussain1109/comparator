@@ -8,7 +8,7 @@ from copy import deepcopy
 import numpy as np
 import pytest
 from PyQt6.QtCore import QPointF, QTimer
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QApplication, QCheckBox, QMessageBox
 
 from src.ui.neuroiris import MainWindow
 from src.ui.dialogs import (CameraDialog, DatasetDialog, HistoryDialog,
@@ -299,6 +299,39 @@ def test_locked_operator_can_train_saved_settings_without_configure(app):
     assert ("train", "inner_face", "geometry") in service.calls
     assert not any(isinstance(call, tuple) and call[0] == "configure" for call in service.calls)
     assert not dialog.steps.isEnabled()
+    dialog.close()
+
+
+@pytest.mark.parametrize("unlocked", [False, True])
+def test_imagenette_automatic_download_needs_no_editable_checkbox(app, unlocked):
+    service = GuardService()
+    service.set_technician_pin("local-test-123")
+    if unlocked:
+        assert service.unlock_technician("local-test-123")
+    # Existing installations can retain the former disabled setting.
+    service.config["models"]["efficientad"] = {"download_imagenette": False}
+    service.train = lambda view, backend, progress: service.calls.append(("train", view, backend)) or {"trained": True}
+    dialog = TrainingDialog(service)
+    dialog.show()
+    app.processEvents()
+
+    assert dialog.imagenette_status.isVisible()
+    assert dialog.imagenette_status.isEnabled()
+    assert "automatically" in dialog.imagenette_status.text()
+    assert not any("Imagenette" in checkbox.text() for checkbox in dialog.findChildren(QCheckBox))
+    assert dialog.imagenet.isEnabled() is unlocked
+    assert dialog.start.isEnabled()
+
+    dialog.start_job()
+    wait_until(app, lambda: not dialog.busy)
+
+    assert ("train", "inner_face", "geometry") in service.calls
+    configured = [call[1] for call in service.calls if call[0] == "configure"]
+    assert len(configured) == int(unlocked)
+    if configured:
+        assert "download_imagenette" not in configured[0]["models"]["efficientad"]
+    assert dialog.imagenette_status.isEnabled()
+    assert dialog.imagenet.isEnabled() is unlocked
     dialog.close()
 
 
