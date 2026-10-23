@@ -9,10 +9,11 @@ import secrets
 import cv2
 import numpy as np
 import pytest
-from PyQt6.QtWidgets import QApplication, QDialog, QWidget
+from PyQt6.QtWidgets import QApplication, QDialog, QPushButton, QWidget
 
 from src.service import NeuroIrisService
 from src.ui.neuroiris import MainWindow
+from src.ui.dialogs import TechnicalDialog
 from src.ui.phone_control import PhoneControlDialog, pairing_qr_image
 
 
@@ -199,11 +200,23 @@ def test_phone_setup_starts_explicitly_rotates_pairing_and_stops_on_close(window
             return f"http://{address}:{self.port}/#token={self.token}"
     monkeypatch.setattr("src.remote.server.PhoneControlServer", FakeServer)
     assert window.phone_server is None
+    assert not any("Phone Control" in button.text()
+                   for button in window.centralWidget().findChildren(QPushButton))
+    with monkeypatch.context() as locked:
+        locked.setattr(window, "ensure_technician", lambda: False)
+        window.open_phone_control()
+        assert not window._dialogs
+    window.service.set_technician_pin("local-phone-test-123")
+    assert window.service.unlock_technician("local-phone-test-123")
     window.start_phone_control(0)
     first = window.phone_server
     token = first.token
-    window.open_phone_control()
+    window.open_technical()
     app.processEvents()
+    settings = next(dialog for dialog in window._dialogs if isinstance(dialog, TechnicalDialog))
+    settings.phone_control.click()
+    wait_until(app, lambda: any(isinstance(dialog, PhoneControlDialog) for dialog in window._dialogs))
+    assert not any(isinstance(dialog, TechnicalDialog) and dialog.isVisible() for dialog in window._dialogs)
     dialog = next(dialog for dialog in window._dialogs if isinstance(dialog, PhoneControlDialog))
     assert first.running and not dialog.start.isEnabled()
     dialog.address.setEditText("192.168.1.50")

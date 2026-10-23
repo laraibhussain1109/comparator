@@ -215,9 +215,6 @@ class MainWindow(QMainWindow):
         self.canvas_label.setStyleSheet("font-weight:600;color:#a5bdad;")
         live_header.addWidget(self.canvas_label)
         live_header.addStretch()
-        self.phone_control = QPushButton("Phone Control")
-        self.phone_control.clicked.connect(self.open_phone_control)
-        live_header.addWidget(self.phone_control)
         self.show_live = QPushButton("Show Live Preview")
         self.show_live.clicked.connect(self.resume_preview)
         live_header.addWidget(self.show_live)
@@ -361,7 +358,6 @@ class MainWindow(QMainWindow):
         self.cancel.setEnabled(not busy and active)
         self.view.setEnabled(not busy)
         self.inspection_mode.setEnabled(not busy and not active)
-        self.phone_control.setEnabled(not busy)
         for key, button in self.action_buttons.items():
             button.setEnabled(not busy)
         self.action_buttons["START INSPECTION"].setEnabled(not busy and not self.camera_running)
@@ -597,6 +593,8 @@ class MainWindow(QMainWindow):
             self.phone_broker.stop()
 
     def open_phone_control(self) -> None:
+        if not self.ensure_technician():
+            return
         from src.ui.phone_control import PhoneControlDialog
         existing = next((dialog for dialog in self._dialogs if isinstance(dialog, PhoneControlDialog)), None)
         if existing is not None:

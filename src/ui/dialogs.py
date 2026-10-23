@@ -1154,6 +1154,10 @@ class TechnicalDialog(QDialog):
         export = QPushButton("Export Diagnostic Report…")
         export.clicked.connect(lambda: export_json(self, {"diagnostics": service.diagnostics(), "last_result": last_result}, "neuroiris-diagnostics.json"))
         row.addWidget(export)
+        self.phone_control = QPushButton("Phone Control…")
+        self.phone_control.setEnabled(callable(getattr(parent, "open_phone_control", None)))
+        self.phone_control.clicked.connect(self.open_phone_control)
+        row.addWidget(self.phone_control)
         layout.addLayout(row)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)
@@ -1163,6 +1167,13 @@ class TechnicalDialog(QDialog):
         self.timer.start(2000)
         self.refresh()
         self.display_map(self.map_choice.currentText())
+
+    def open_phone_control(self) -> None:
+        callback = getattr(self.parentWidget(), "open_phone_control", None)
+        if callable(callback):
+            # Release this modal settings window before opening pairing setup.
+            self.accept()
+            QTimer.singleShot(0, callback)
 
     def _find_maps(self, data: Any, prefix: str = "") -> None:
         if isinstance(data, dict):
