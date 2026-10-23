@@ -151,6 +151,10 @@ class MainWindow(QMainWindow):
         self._dialogs: list[QWidget] = []
         self._model_readiness: dict[str, Any] | None = None
         self._manual_image: np.ndarray | None = None
+        self._manual_capture_revision = 0
+        from src.remote.broker import PhoneControlBroker
+        self.phone_broker = PhoneControlBroker()
+        self.phone_server = None
         self.setWindowTitle("NeuroIris — Aluminium Vision Inspection | Stavatech")
         self.setStyleSheet(STYLE)
         self._build()
@@ -168,6 +172,10 @@ class MainWindow(QMainWindow):
         self.refresh_status()
         self.refresh_model_readiness()
         QApplication.instance().installEventFilter(self)
+        self._phone_timer = QTimer(self)
+        self._phone_timer.timeout.connect(self.poll_phone_control)
+        self._phone_timer.start(100)
+        self.publish_phone_state()
 
     def _build(self) -> None:
         root = QWidget()
@@ -207,6 +215,9 @@ class MainWindow(QMainWindow):
         self.canvas_label.setStyleSheet("font-weight:600;color:#a5bdad;")
         live_header.addWidget(self.canvas_label)
         live_header.addStretch()
+        self.phone_control = QPushButton("Phone Control")
+        self.phone_control.clicked.connect(self.open_phone_control)
+        live_header.addWidget(self.phone_control)
         self.show_live = QPushButton("Show Live Preview")
         self.show_live.clicked.connect(self.resume_preview)
         live_header.addWidget(self.show_live)
@@ -350,6 +361,7 @@ class MainWindow(QMainWindow):
         self.cancel.setEnabled(not busy and active)
         self.view.setEnabled(not busy)
         self.inspection_mode.setEnabled(not busy and not active)
+        self.phone_control.setEnabled(not busy)
         for key, button in self.action_buttons.items():
             button.setEnabled(not busy)
         self.action_buttons["START INSPECTION"].setEnabled(not busy and not self.camera_running)
@@ -364,7 +376,8 @@ class MainWindow(QMainWindow):
         self.log.append(message)
         QMessageBox.warning(self, "NeuroIris", message)
 
-    def run_task(self, name: str, operation: Callable, done: Callable | None = None) -> None:
+    def run_task(self, name: str, operation: Callable, done: Callable | None = None,
+                 failed: Callable | None = None) -> None:
         if self._thread is not None:
             return
         self._job_name = name
@@ -379,7 +392,7 @@ class MainWindow(QMainWindow):
         thread.started.connect(worker.run)
         worker.progress.connect(self._on_progress)
         worker.result.connect(done or self._task_done)
-        worker.failed.connect(self._error)
+        worker.failed.connect(failed or self._error)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(self._task_finished)
@@ -471,22 +484,127 @@ class MainWindow(QMainWindow):
                 return True
         return super().eventFilter(watched, event)
 
-    def record_manual_verdict(self, verdict: str) -> None:
-        if not self.is_manual_inspection() or self._thread is not None or not self.session:
-            return
+    def _manual_decision_problem(self) -> str:
+        if not self.is_manual_inspection():
+            return "Select manual inspection mode on the PC."
+        if self._thread is not None:
+            return "Wait for the current operation to finish."
+        if not self.session:
+            return "Start a physical part session on the PC."
         if str(self.session.get("status", "")).upper() in {"FAIL_LOCKED", "RESULT_LOCKED", "CANCELLED", "FINALIZED", "COMPLETE"}:
-            return
+            return "This part is locked. Finalize it and start the next part on the PC."
         view = self.selected_view()
+        enabled = self.service.config.get("views", {}).get("enabled", list(VIEW_LABELS))
+        if view == "auto" or view not in enabled:
+            return "Select the presented housing face on the PC."
         previous = self.session.get("views", {}).get(view)
         if previous is not None and previous.get("verdict") != "RECHECK":
-            return
+            return "This face already has a locked decision. Select the next required face on the PC."
         image = self._manual_image if self._manual_image is not None else (self._latest if self.camera_running else None)
-        if image is None:
-            self.status.setText("Capture a current view or open a saved image before recording its decision.")
-            return
+        if (not isinstance(image, np.ndarray) or image.ndim != 3 or image.dtype != np.uint8 or
+                image.shape[2] != 3 or min(image.shape[:2]) < 1):
+            return "Capture a current view or open a saved image before recording its decision."
+        return ""
+
+    def record_manual_verdict(self, verdict: str, done: Callable | None = None,
+                              failed: Callable | None = None) -> bool:
+        problem = self._manual_decision_problem()
+        if problem:
+            self.status.setText(problem)
+            return False
+        view = self.selected_view()
+        image = self._manual_image if self._manual_image is not None else self._latest
         image = image.copy()
         identity = str(self.session.get("part_id", self.part_id.text()))
-        self.run_task("Recording view decision", lambda progress: self.service.record_manual_decision(view, verdict, identity, image), self.on_manual_inspection)
+        def recorded(result: dict[str, Any]) -> None:
+            self.on_manual_inspection(result)
+            if done:
+                done(result)
+        self.run_task("Recording view decision", lambda progress: self.service.record_manual_decision(view, verdict, identity, image), recorded, failed)
+        return True
+
+    def _phone_dialog_open(self) -> bool:
+        app = QApplication.instance()
+        return bool(app.activeModalWidget() or app.activePopupWidget() or
+                    any(dialog.isVisible() for dialog in self._dialogs))
+
+    def publish_phone_state(self) -> dict[str, Any]:
+        session = self.session or {}
+        dialog_open = self._phone_dialog_open()
+        problem = self._manual_decision_problem()
+        if dialog_open:
+            problem = "Close the PC setup or inspection dialog before sending decisions."
+        view = self.selected_view()
+        display = self.verdict.text()
+        verdict = {value: key for key, value in MANUAL_VERDICTS.items()}.get(display, display)
+        self.phone_broker.publish({
+            "mode": "manual" if self.is_manual_inspection() else "automatic",
+            "part_id": str(session.get("part_id", "")),
+            "event_id": str(session.get("event_id", "")),
+            "view": view, "view_label": VIEW_LABELS.get(view, view),
+            "can_submit": not bool(problem), "reason": problem,
+            "verdict": verdict, "display_decision": display,
+            "_context_key": (session.get("event_id"), view,
+                             len(session.get("attempts", [])), session.get("status"),
+                             id(self._manual_image) if self._manual_image is not None else None,
+                             self._manual_capture_revision,
+                             self.camera_running, self._thread is not None, dialog_open),
+        })
+        return self.phone_broker.snapshot()[1]
+
+    def poll_phone_control(self) -> None:
+        self.publish_phone_state()
+        command = self.phone_broker.take_next()
+        if command is None:
+            return
+        request_id = command["request_id"]
+        # HTTP requests only queue work. Inspect current GUI state again on the
+        # GUI thread before invoking the same path used by local decisions.
+        current = self.publish_phone_state()
+        problem = self._manual_decision_problem()
+        if self._phone_dialog_open():
+            problem = "Close the PC setup or inspection dialog before sending decisions."
+        if current.get("context_id") != command.get("context_id"):
+            problem = "The part, face or capture changed. Review the current PC state and try again."
+        if problem:
+            self.phone_broker.complete(request_id, False, error=problem)
+            return
+        def recorded(result: dict[str, Any]) -> None:
+            self.phone_broker.complete(request_id, True, verdict=str(result.get("verdict", "RECHECK")))
+            self.publish_phone_state()
+        def failed(message: str) -> None:
+            self.phone_broker.complete(request_id, False, error=message)
+            self.publish_phone_state()
+            self._error(message)
+        if not self.record_manual_verdict(str(command["verdict"]), recorded, failed):
+            self.phone_broker.complete(request_id, False, error="The current view is no longer available for a decision.")
+        self.publish_phone_state()
+
+    def start_phone_control(self, port: int = 8765) -> None:
+        if self.phone_server is not None and self.phone_server.running:
+            return
+        from src.remote.server import PhoneControlServer
+        server = PhoneControlServer(self.phone_broker, host="0.0.0.0", port=port)
+        server.start()
+        self.phone_server = server
+        self.publish_phone_state()
+
+    def stop_phone_control(self) -> None:
+        if self.phone_server is not None:
+            self.phone_server.stop()
+            self.phone_server = None
+        else:
+            self.phone_broker.stop()
+
+    def open_phone_control(self) -> None:
+        from src.ui.phone_control import PhoneControlDialog
+        existing = next((dialog for dialog in self._dialogs if isinstance(dialog, PhoneControlDialog)), None)
+        if existing is not None:
+            existing.show()
+            existing.raise_()
+            existing.activateWindow()
+            return
+        self._open_dialog(PhoneControlDialog(self))
 
     def on_manual_inspection(self, result: dict[str, Any]) -> None:
         self.on_inspection(result)
@@ -696,6 +814,7 @@ class MainWindow(QMainWindow):
             return
         if self.is_manual_inspection():
             self._manual_image = self._latest.copy()
+            self._manual_capture_revision += 1
             self.canvas.set_image(self._manual_image)
             self._showing_result = True
             self.canvas_label.setText("CAPTURED EVIDENCE · " + VIEW_LABELS.get(self.selected_view(), self.selected_view()))
@@ -722,6 +841,7 @@ class MainWindow(QMainWindow):
             return
         if self.is_manual_inspection():
             self._manual_image = image.copy()
+            self._manual_capture_revision += 1
             self.canvas.set_image(self._manual_image)
             self._showing_result = True
             self.canvas_label.setText("CAPTURED EVIDENCE · " + VIEW_LABELS.get(self.selected_view(), self.selected_view()))
@@ -906,6 +1026,8 @@ class MainWindow(QMainWindow):
             return
         self._timer.stop()
         self._clock.stop()
+        self._phone_timer.stop()
+        self.stop_phone_control()
         QApplication.instance().removeEventFilter(self)
         if hasattr(self.service, "lock_technician"):
             self.service.lock_technician()
