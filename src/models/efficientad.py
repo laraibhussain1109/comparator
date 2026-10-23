@@ -181,9 +181,12 @@ class EfficientADBackend:
         self._trained = False
         self.metadata = {}
         self._validate_settings()
-        emit(1, "Checking real pretrained teacher and natural-image penalty dataset")
-        natural_paths = natural_image_paths(self.settings, progress=lambda message: emit(1, message))
-        teacher_path, provenance = teacher_weights(self.settings, progress=lambda message: emit(3, message))
+        emit(1, "Preparing training assets before EfficientAD optimizer steps")
+        natural_paths = natural_image_paths(
+            self.settings, progress=lambda message: emit(1, f"Preparing training assets (Imagenette): {message}"))
+        teacher_path, provenance = teacher_weights(
+            self.settings, progress=lambda message: emit(3, f"Preparing training assets (EfficientAD teacher): {message}"))
+        emit(4, "Training assets ready; initializing EfficientAD before optimizer steps")
         torch, _, _ = _dependencies()
         torch.manual_seed(int(self.settings["seed"]))
         if torch.cuda.is_available():
@@ -217,6 +220,7 @@ class EfficientADBackend:
         history: list[dict] = []
         self.model.train()
         self.model.teacher.eval()
+        emit(6, f"Starting EfficientAD training: {steps} optimizer steps on {self.device}")
         try:
             for step in range(steps):
                 if step and step % len(good_images) == 0:

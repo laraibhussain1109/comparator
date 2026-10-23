@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 import cv2
 import numpy as np
-from PyQt6.QtCore import QThread, QTimer, Qt
+from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtGui import QTextCursor
 from PyQt6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QDoubleSpinBox, QFileDialog, QFormLayout, QGridLayout, QGroupBox, QHBoxLayout,
@@ -389,6 +389,8 @@ class DatasetDialog(WorkDialog):
 
 
 class TrainingDialog(WorkDialog):
+    models_changed = pyqtSignal()
+
     def __init__(self, service: Any, parent: QWidget | None = None, evaluate: bool = False):
         super().__init__(service, "Evaluate Model · blind held-out parts" if evaluate else "Train Model · view-specific learning", parent)
         self.evaluate = evaluate
@@ -398,6 +400,9 @@ class TrainingDialog(WorkDialog):
         self._screening_baseline_known = False
         self._screening_requested_view: str | None = None
         self._screening_attempt_active = False
+        self._training_requested_view: str | None = None
+        self._training_requested_backend: str | None = None
+        self._training_can_activate = False
         self.footer.setTextFormat(Qt.TextFormat.PlainText)
         settings = service.config.get("models", {})
         form = QFormLayout()
@@ -506,6 +511,8 @@ class TrainingDialog(WorkDialog):
         self._training_controls = [self.steps, self.batch, self.input_size, self.imagenet, self.teacher_cache,
             self.download_teacher, self.learning_rate, self.tile, self.overlap,
             self.validation, self.test_fraction, self.group_sessions]
+        if not evaluate:
+            self._training_controls.append(self.backend)
         self.finish_layout()
         self._apply_technician_restrictions()
         self.view.currentIndexChanged.connect(self.refresh)
@@ -540,8 +547,16 @@ class TrainingDialog(WorkDialog):
             self._append_output(message)
 
     def start_job(self) -> None:
+        if self.busy:
+            return
         view, backend = str(self.view.currentData()), str(self.backend.currentData())
-        if not self.evaluate and self._can_edit_settings():
+        allowed = self._can_edit_settings()
+        if not self.evaluate and not allowed:
+            # Operators use the commissioned mode, even if a programmatic UI
+            # change tried to alter a disabled dropdown.
+            backend = str(self.service.config.get("models", {}).get("backend", "hybrid"))
+            self.backend.setCurrentIndex(max(0, self.backend.findData(backend)))
+        if not self.evaluate and allowed:
             if self.validation.value() + self.test_fraction.value() >= .8:
                 error(self, "Keep sufficient physical parts for training. Validation plus test fractions must be below 0.8.")
                 return
@@ -556,6 +571,9 @@ class TrainingDialog(WorkDialog):
         self.output.clear()
         self.export.setEnabled(False)
         if not self.evaluate:
+            self._training_requested_view = view
+            self._training_requested_backend = backend
+            self._training_can_activate = allowed
             self._begin_screening_attempt(view)
         operation = self.service.evaluate if self.evaluate else self.service.train
         self.run(lambda progress: operation(view, backend, progress), self.completed)
@@ -683,10 +701,45 @@ class TrainingDialog(WorkDialog):
     def completed(self, report: dict) -> None:
         self.report = report
         self._append_output(json_text(report))
-        if not self.evaluate:
-            self._refresh_screening(report.get("training_screening"))
         self.export.setEnabled(True)
-        self.footer.setText("Evaluation completed. Review sample counts, coverage and false rejects before selecting this model." if self.evaluate else "Training completed and model artifacts saved. Review independent validation before using this model.")
+        if self.evaluate:
+            self.footer.setText("Evaluation completed. Review sample counts, coverage and false rejects before selecting this model.")
+            return
+        self._refresh_screening(report.get("training_screening"))
+        view = self._training_requested_view or str(report.get("view") or self.view.currentData())
+        requested = self._training_requested_backend or str(self.backend.currentData())
+        trained = str(report.get("backend") or ("efficientad" if requested == "hybrid" else requested))
+        active = str(self.service.config.get("models", {}).get("backend", "hybrid"))
+        warning = ""
+        expected = "efficientad" if requested == "hybrid" else requested
+        if trained != expected:
+            warning = "The saved backend differs from the requested mode. Select the compatible saved model in Model Settings."
+        elif requested != active:
+            if self._training_can_activate and self._can_edit_settings():
+                try:
+                    select_mode = getattr(self.service, "set_mode", None)
+                    if callable(select_mode):
+                        select_mode(requested)
+                    else:
+                        self.service.configure({"models": {"backend": requested}})
+                except Exception as exc:
+                    # The model is already published. Keep its successful report
+                    # and export available even if a settings write fails.
+                    warning = f"Model saved, but activating {BACKEND_LABELS.get(requested, requested)} failed: {exc}. Select it in Model Settings."
+            else:
+                warning = "Model saved. Unlock Technician Access and select its mode in Model Settings before inspection."
+            active = str(self.service.config.get("models", {}).get("backend", "hybrid"))
+            if not warning and active != requested:
+                warning = "Model saved, but the active mode did not change. Select its mode in Model Settings before inspection."
+        lines = [f"Training completed for {VIEW_LABELS.get(view, view)}. Trained backend: {BACKEND_LABELS.get(trained, trained)}.",
+                 f"Active inspection mode: {BACKEND_LABELS.get(active, active)}."]
+        if report.get("artifact_path"):
+            lines.append("Saved model folder: " + str(report["artifact_path"]))
+        if warning:
+            lines.append(warning)
+        lines.append("Review independent validation before using this model.")
+        self.footer.setText("\n".join(lines))
+        self.models_changed.emit()
 
 
 class CameraDialog(WorkDialog):
@@ -828,7 +881,7 @@ class ModelSettingsDialog(QDialog):
         try:
             self._models = [model for model in self.service.models() if model.get("view") == self.view.currentData() and model.get("backend") == ("efficientad" if self.backend.currentData() == "hybrid" else self.backend.currentData())]
             self.models.clear()
-            self.models.addItem("Use currently selected / latest valid model", None)
+            self.models.addItem("Use currently selected model", None)
             for model in self._models:
                 self.models.addItem(str(model.get("version", model.get("id", "Saved model"))), model)
             self.show_metadata()

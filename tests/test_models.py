@@ -101,9 +101,10 @@ def test_asset_download_progress_reaches_training_observer(tmp_path, monkeypatch
     """Large asset transfers stay visible before optional neural construction."""
     import src.models.efficientad as efficientad
 
-    natural_messages = ["Downloading Imagenette: 12 MiB", "Retrying interrupted Imagenette download",
+    natural_messages = ["Downloading imagenette2.tgz: 99%", "Retrying interrupted Imagenette download",
                         "Extracting Imagenette training photographs"]
-    teacher_messages = ["Using verified pretrained teacher cache"]
+    teacher_messages = ["Downloading efficientad_pretrained_weights.zip: 99%",
+                        "Using verified pretrained teacher cache"]
 
     def natural_images(settings, *, progress=None):
         assert progress is not None
@@ -128,8 +129,10 @@ def test_asset_download_progress_reaches_training_observer(tmp_path, monkeypatch
     with pytest.raises(ModelSetupError, match="intentionally not exercised"):
         backend.fit([np.zeros((256, 256, 3), np.uint8)], tmp_path / "model",
                     progress=lambda percent, message: updates.append((percent, message)))
-    forwarded = [message for _, message in updates[1:]]
-    assert forwarded == natural_messages + teacher_messages
+    forwarded = [message for _, message in updates[1:-1]]
+    assert forwarded == ([f"Preparing training assets (Imagenette): {message}" for message in natural_messages]
+                         + [f"Preparing training assets (EfficientAD teacher): {message}" for message in teacher_messages])
+    assert updates[-1] == (4, "Training assets ready; initializing EfficientAD before optimizer steps")
     assert all(0 <= percent < 5 for percent, _ in updates)
     assert not backend.trained
     assert not (tmp_path / "model").exists()

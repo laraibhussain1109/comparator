@@ -32,6 +32,6 @@ Run-Python -Arguments @("-m", "pip", "install", "-r", "requirements-neural.txt")
 Run-Python -Arguments @("-m", "pip", "check")
 Run-Python -Arguments @("-c", "import torch; from anomalib.models.image.efficient_ad.torch_model import EfficientAdModel; print('PyTorch', torch.__version__, 'CUDA build', torch.version.cuda, 'available', torch.cuda.is_available()); print('Actual compute device:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'); x=torch.ones((16,16),device='cuda' if torch.cuda.is_available() else 'cpu'); print('Executed matrix multiplication:',float((x@x).sum().item()))")
 Write-Host "Neural packages installed. A GPU was used only if the actual compute probe above reported CUDA."
-Write-Host "Training also requires genuine ImageNet/ImageNette photographs for the penalty dataset."
-Write-Host "Set models.efficientad.imagenet_dir or enable models.efficientad.download_imagenette."
+Write-Host "Missing Imagenette photographs download and extract automatically when training starts."
+Write-Host "HTTPS downloads use native Windows certificate validation through truststore."
 Write-Host "Teacher weights download with a published Anomalib SHA256 check; offline cache is reused."

@@ -111,3 +111,41 @@ an empty custom image directory and the legacy false setting. It automatically
 extracted all **9,469 training photographs**, then reused them with network access
 disabled. The application also passed its offscreen startup smoke test. Windows
 CI includes the new automatic preparation and operator UI regressions.
+
+## Certificate-chain handling and saved-model readiness
+
+The reported `unable to get local issuer certificate` error occurs during asset
+preparation, before optimizer training/model publication. The downloader now
+uses pinned `truststore==0.10.5` per-request TLS contexts, enabling native
+Windows CryptoAPI certificate-chain validation while preserving hostname,
+issuer and date checks. Errors identify the failing asset/URL/cache path and no
+longer give generic clock advice. Download progress is labeled as Imagenette or
+EfficientAD-teacher preparation, separately from actual optimizer steps.
+
+Five real local HTTPS tests generate their CA, keys and certificates only in
+temporary directories. They verify a trusted-CA download, reject untrusted
+issuers/wrong hostnames/expired certificates before requesting asset data, and
+reject an incorrect payload SHA256 even over valid TLS. No system trust stores
+are modified. A fresh official teacher archive download through the new context
+completed, matched the published SHA256, and extracted its teacher checkpoint.
+That newly prepared teacher was then used by the genuine neural tests.
+
+The dashboard now reports selected-mode model availability per face before
+captures and includes the model-store location. Missing models retain the
+latest failed-training reason where available. Hybrid/EfficientAD can resolve a
+missing compatible selection through each other's active pointer, while an
+explicit invalid selection, corrupt files, wrong product/view/version, or
+incompatible mode remains rejected. Inference still verifies file hashes;
+dashboard checks avoid loading neural weights. Successful technician-initiated
+training activates its requested mode only after the model is saved; failures
+preserve the active mode and previous model.
+
+The full pinned neural-enabled suite passed **337 tests in 91.94 seconds**,
+without skips, including the real TLS tests, model selection/readiness, locked
+and unlocked training, per-view/optional-view UI guards, actual EfficientAD
+optimization/reload and service calibration/evaluation. The focused combined
+artifact/readiness/UI/service suite previously passed **84 tests**. The actual
+application passed its offscreen startup smoke test. Windows CI includes native
+TLS, model selection/readiness, training UI and service regression tests;
+physical-camera, target-GPU and user-network behavior still require checks on
+the workstation.

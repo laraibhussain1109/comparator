@@ -102,6 +102,31 @@ Calibration uses independent GOOD validation-part maxima, an explicit false-reje
 
 Training writes versioned, integrity-checked bundles, then atomically activates the completed bundle. A failed run preserves the prior valid model. Bundles contain the registration template, geometry profile, real neural checkpoint when trained, ROIs, preprocessing, raw-score thresholds, physical-part split manifest, packages, reports and model versions. Restart loads these artifacts without retraining. Legacy joblib artifacts from the previous prototype are not accepted as EfficientAD models.
 
+The dashboard shows saved-model availability for each required face and the
+selected inspection mode. **MODEL SETUP NEEDED** means the selected model is
+missing or incompatible; it is shown before analyzing an image. If Geometry
+models exist while Hybrid is selected, select Geometry in **MODEL SETTINGS** or
+complete Hybrid training for that face. When a technician chooses a different
+training backend, successful training activates that selected inspection mode;
+a failed training run leaves the active mode unchanged. The completed training
+screen names the trained backend, active inspection mode and saved model folder.
+
+When updating the application, preserve the successful installation's
+`artifacts/`, `runtime/` and `dataset/` folders. Downloading a fresh source ZIP
+does not include the models trained on your workstation. The default Face A
+model folder is `artifacts/aluminium_housing/inner_face/`, and Face B uses
+`ribbed_face/`. The dashboard displays the actual configured model location.
+Hybrid and EfficientAD can resolve each other's compatible active selection if
+one selection file is missing; an explicit corrupt selection or changed
+calibration is still rejected. If versions exist without an active selection,
+choose the saved version explicitly in **MODEL SETTINGS**.
+
+Inspecting a file under `NG/` runs the same model pipeline as any other image;
+the folder name does not set the result. GOOD images train the normal
+EfficientAD representation; independent NG examples calibrate and evaluate
+defect detection. Training completion and evaluation reports establish what
+the saved model can detect on the available data.
+
 ## Inspect one physical part
 
 1. Click **START INSPECTION** to connect the selected camera and start the native preview. Create a **New Part** with a unique physical ID.

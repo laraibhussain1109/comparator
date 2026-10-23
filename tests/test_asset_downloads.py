@@ -100,8 +100,11 @@ def test_ssl_record_failure_resumes_partial_transfer_with_validated_range(tmp_pa
     assert request_headers(requests[0][0])["accept-encoding"] == "identity"
     assert no_backoff_wait
     assert messages, "The training UI must receive asset-download status messages"
-    # The standard HTTPS opener's certificate verification must stay enabled.
-    assert all("context" not in kwargs for _, kwargs in requests)
+    # Native trust must retain certificate and hostname verification.
+    contexts = [kwargs["context"] for _, kwargs in requests]
+    assert contexts[0] is contexts[1]
+    assert all(context.verify_mode == ssl.CERT_REQUIRED and context.check_hostname
+               for context in contexts)
     assert_no_temporary_files(tmp_path)
 
 

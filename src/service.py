@@ -86,6 +86,7 @@ class NeuroIrisService:
             self._diagnostics = runtime_diagnostics()
         return {**self._diagnostics, 'camera': self.camera.diagnostics() if self.camera else {'status': 'disconnected'},
                 'selected_backend': self.config['models']['backend'],
+                'model_store': display_path(self.artifacts.root),
                 'loaded_models': [{'view': key[0], 'mode': key[1], 'version': pipeline.metadata['version'],
                                    'inference_device': str(getattr(pipeline.model, 'device', 'cpu')) if pipeline.model else 'cpu'}
                                   for key, pipeline in self._pipelines.items()],
@@ -222,16 +223,92 @@ class NeuroIrisService:
         return {**data, 'verdict': aggregate['verdict'], 'status': self.session.state.value,
                 'reasons': aggregate['reasons']}
 
+    def _validate_model_configuration(self, metadata, view):
+        settings = metadata.get('settings')
+        if not isinstance(settings, dict):
+            raise ValueError('Saved model has no calibrated inspection settings. Select a complete model or retrain this view.')
+        if any(settings.get(section, {}) != _jsonable(self.config.get(section, {}))
+               for section in ('quality', 'registration', 'geometry', 'calibration', 'tiling', 'localization')):
+            raise RuntimeError('Inspection settings changed after calibration. Retrain this view or restore the settings saved with its model.')
+        if metadata.get('rois', []) != self.get_rois(view):
+            raise RuntimeError('The ROI configuration changed after calibration. Retrain this view before inspection.')
+
+    def model_readiness(self, views=None):
+        """Report saved-model availability without loading neural weights.
+
+        This is a setup check for the dashboard. Inference still verifies every
+        model file and loads the actual pipeline before producing a verdict.
+        No mode, selected version or inspection configuration is changed here.
+        """
+        backend = self.config['models']['backend']
+        requested = list(self.config['views']['required'] if views is None else views)
+        if not set(requested) <= set(self.config['views']['enabled']):
+            raise ValueError('Model readiness requires enabled housing views')
+        names = {'inner_face': 'Face A', 'ribbed_face': 'Face B',
+                 'side_left': 'Left side', 'side_right': 'Right side'}
+
+        def saved(view, mode):
+            directory = self.artifacts.active(view, mode, verify_files=False)
+            metadata = json.loads((directory / 'manifest.json').read_text(encoding='utf-8'))
+            required = ['template.png', 'geometry.npz', 'thresholds.json']
+            if mode in {'hybrid', 'efficientad'}:
+                required += ['neural/efficientad.pt', 'neural/model.json']
+            listed = {Path(name).as_posix() for name in metadata['files']}
+            for name in required:
+                if name not in listed or not (directory / name).is_file():
+                    raise ValueError(f'Saved model is incomplete: {name}. Model folder: {display_path(directory)}')
+            self._validate_model_configuration(metadata, view)
+            return directory, metadata
+
+        rows = []
+        for view in requested:
+            row = {'view': view, 'ready': False, 'status': 'missing', 'version': None,
+                   'reason': '', 'available_modes': []}
+            try:
+                directory, metadata = saved(view, backend)
+                row.update(ready=True, status='ready', version=metadata['version'],
+                           path=display_path(directory))
+            except FileNotFoundError as exc:
+                row['reason'] = str(exc)
+            except (OSError, RuntimeError, ValueError, KeyError, TypeError) as exc:
+                row.update(status='invalid', reason=str(exc))
+            if not row['ready']:
+                for mode in sorted(MODES - {backend}):
+                    try:
+                        saved(view, mode)
+                        row['available_modes'].append(mode)
+                    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
+                        continue
+                try:
+                    last_training = self.training_screening(view)
+                    if last_training.get('status') == 'failed' and last_training.get('error'):
+                        row['last_training_error'] = str(last_training['error'])
+                        row['reason'] += f' Last training did not complete: {last_training["error"]}'
+                except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                    pass  # A damaged audit report cannot conceal model availability.
+            rows.append(row)
+        ready = bool(rows) and all(row['ready'] for row in rows)
+        details = [f'{names.get(row["view"], row["view"])}: '
+                   + (f'saved model {row["version"]}' if row['ready'] else f'{row["status"]} {backend} model')
+                   + (f' (available: {", ".join(row["available_modes"])})' if row['available_modes'] else '')
+                   for row in rows]
+        legacy = any((self.artifacts.root.parent / name).is_file()
+                     for name in ('patchcore/model.joblib', 'visual_changenet/model.joblib'))
+        message = f'{backend.capitalize()} models — ' + '; '.join(details)
+        if not ready:
+            message += '. Open Train Model for the missing face, or Model Settings to select a trained mode/version.'
+            message += f' Model folder: {display_path(self.artifacts.root)}'
+            if legacy:
+                message += ' First-version model files were found; they require training in the new view-specific model format.'
+        return {'backend': backend, 'ready': ready, 'artifact_root': display_path(self.artifacts.root),
+                'views': rows, 'message': message, 'legacy_models_found': legacy}
+
     def _pipeline(self, view, backend):
         directory = self.artifacts.active(view, backend)
         key = (view, backend, directory.name)
         if key not in self._pipelines:
             metadata = ArtifactStore.verify(directory)
-            if any(metadata['settings'].get(section, {}) != _jsonable(self.config.get(section, {}))
-                   for section in ('quality', 'registration', 'geometry', 'calibration', 'tiling', 'localization')):
-                raise RuntimeError('Inspection settings changed after calibration. Retrain this view or restore the settings saved with its model.')
-            if metadata.get('rois', []) != self.get_rois(view):
-                raise RuntimeError('The ROI configuration changed after calibration. Retrain this view before inspection.')
+            self._validate_model_configuration(metadata, view)
             self._pipelines[key] = ViewPipeline(directory, backend)
         return self._pipelines[key]
 

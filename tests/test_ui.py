@@ -7,8 +7,8 @@ from copy import deepcopy
 
 import numpy as np
 import pytest
-from PyQt6.QtCore import QPointF, QTimer
-from PyQt6.QtWidgets import QApplication, QCheckBox, QMessageBox
+from PyQt6.QtCore import QPointF, QTimer, pyqtSignal
+from PyQt6.QtWidgets import QApplication, QCheckBox, QDialog, QFileDialog, QMessageBox
 
 from src.ui.neuroiris import MainWindow
 from src.ui.dialogs import (CameraDialog, DatasetDialog, HistoryDialog,
@@ -147,6 +147,167 @@ def test_offline_image_uses_explicit_frame_path(app):
     window.analyze(np.zeros((100, 200, 3), np.uint8))
     wait_until(app, lambda: window._thread is None)
     assert ("file", "ribbed_face", "housing-8") in service.calls
+    window.close()
+
+
+class ReadinessService(FakeService):
+    def __init__(self, ready_views=()):
+        super().__init__()
+        self.config["models"]["backend"] = "hybrid"
+        self.ready_views = set(ready_views)
+        self.readiness_checks = 0
+
+    def model_readiness(self, views=None):
+        self.readiness_checks += 1
+        backend = self.config["models"]["backend"]
+        rows = [{"view": view, "ready": view in self.ready_views,
+                 "status": "ready" if view in self.ready_views else "missing",
+                 "version": "controlled-saved-version" if view in self.ready_views else None,
+                 "reason": "" if view in self.ready_views else f"No trained {backend} model for {view}",
+                 "available_modes": [] if view in self.ready_views else ["geometry"]}
+                for view in (self.config["views"]["required"] if views is None else views)]
+        return {"backend": backend, "ready": all(row["ready"] for row in rows),
+                "artifact_root": "C:/NeuroIris/artifacts/aluminium_housing", "views": rows,
+                "message": "Select a saved model or train the missing faces."}
+
+
+def test_model_mode_mismatch_is_visible_before_inspection_without_loading_models(app):
+    service = ReadinessService()
+    window = MainWindow(service)
+    window.show()
+    app.processEvents()
+
+    assert window.model_status.isVisible()
+    assert "Hybrid" in window.model_status.text()
+    assert "Geometry" in window.model_status.text()
+    assert "Face A" in window.model_status.text() and "Face B" in window.model_status.text()
+    assert "C:/NeuroIris/artifacts/aluminium_housing" in window.model_status.text()
+    assert window.verdict.text() == "MODEL SETUP NEEDED"
+    assert window.new_part.isEnabled()
+    assert window.action_buttons["START INSPECTION"].isEnabled()
+    checks = service.readiness_checks
+    window.refresh_status()
+    assert service.readiness_checks == checks, "The camera status timer must not load or inspect model bundles"
+    window.close()
+
+
+@pytest.mark.parametrize("source", ["live", "saved"])
+def test_unavailable_selected_model_blocks_capture_before_recording_a_view(app, source):
+    service = ReadinessService()
+    window = MainWindow(service)
+    window.part_id.setText("housing-needs-model")
+    window.begin_part()
+    window.view.setCurrentIndex(window.view.findData("inner_face"))
+    if source == "live":
+        window.camera_running = True
+        window._latest = np.zeros((100, 200, 3), np.uint8)
+        window.capture_view()
+    else:
+        window.analyze(np.zeros((100, 200, 3), np.uint8))
+
+    assert not any(isinstance(call, tuple) and call[0] in {"live", "file"} for call in service.calls)
+    assert service.session["views"] == {}
+    assert window._thread is None
+    assert window.verdict.text() == "MODEL SETUP NEEDED"
+    assert "inner_face" in window.reasons.text()
+    assert "MODEL SETTINGS" in window.reasons.text()
+    assert window.count_labels["total"].text() == "0"
+    window.close()
+
+
+def test_ready_face_can_be_inspected_while_another_face_needs_a_model(app):
+    service = ReadinessService({"inner_face"})
+    window = MainWindow(service)
+    window.part_id.setText("housing-partial-models")
+    window.begin_part()
+    window.view.setCurrentIndex(window.view.findData("inner_face"))
+    window.analyze(np.zeros((100, 200, 3), np.uint8))
+    wait_until(app, lambda: window._thread is None)
+
+    assert ("file", "inner_face", "housing-partial-models") in service.calls
+    assert window.verdict.text() == "VIEW PASS"
+    assert set(service.session["views"]) == {"inner_face"}
+    assert "Face B" in window.model_status.text()
+    window.view.setCurrentIndex(window.view.findData("ribbed_face"))
+    window.analyze(np.zeros((100, 200, 3), np.uint8))
+    assert not any(isinstance(call, tuple) and call[:2] == ("file", "ribbed_face") for call in service.calls)
+    assert window.verdict.text() == "MODEL SETUP NEEDED"
+    window.close()
+
+
+def test_auto_view_requires_all_required_models_before_capture(app):
+    service = ReadinessService({"inner_face"})
+    window = MainWindow(service)
+    window.part_id.setText("housing-auto")
+    window.begin_part()
+    assert window.selected_view() == "auto"
+    window.analyze(np.zeros((100, 200, 3), np.uint8))
+
+    assert service.session["views"] == {}
+    assert "Face B" in window.reasons.text()
+    assert window.verdict.text() == "MODEL SETUP NEEDED"
+    window.close()
+
+
+def test_saved_model_signal_and_dialog_close_refresh_dashboard_readiness(app):
+    class SavedModelDialog(QDialog):
+        models_changed = pyqtSignal()
+
+    service = ReadinessService()
+    window = MainWindow(service)
+    dialog = SavedModelDialog(window)
+    window._open_dialog(dialog)
+    service.ready_views.update({"inner_face", "ribbed_face"})
+    dialog.models_changed.emit()
+
+    assert window.verdict.text() == "READY"
+    assert "MODEL SETUP NEEDED" not in window.model_status.text()
+    assert window.model_status.toolTip().count("controlled-saved-version") == 2
+    assert window.model_status.text().count("\n") <= 1
+
+    service.ready_views.clear()
+    dialog.accept()
+    assert window.verdict.text() == "MODEL SETUP NEEDED"
+    assert "No trained hybrid model" in window.model_status.toolTip()
+    window.close()
+
+
+@pytest.mark.parametrize("side_ready", [False, True])
+def test_optional_enabled_side_view_uses_its_own_saved_model_availability(app, side_ready):
+    service = ReadinessService({"inner_face", "ribbed_face"})
+    if side_ready:
+        service.ready_views.add("side_left")
+    window = MainWindow(service)
+    window.part_id.setText("housing-side")
+    window.begin_part()
+    window.view.setCurrentIndex(window.view.findData("side_left"))
+    window.analyze(np.zeros((100, 200, 3), np.uint8))
+    wait_until(app, lambda: window._thread is None)
+
+    assert (("file", "side_left", "housing-side") in service.calls) is side_ready
+    assert "Left side" not in window.model_status.text(), "Optional captures must not change required-face readiness"
+    assert window.verdict.text() == ("VIEW PASS" if side_ready else "MODEL SETUP NEEDED")
+    window.close()
+
+
+def test_saved_ng_filename_uses_inference_without_overriding_its_prediction(app, tmp_path, monkeypatch):
+    import cv2
+    service = ReadinessService({"inner_face", "ribbed_face"})
+    window = MainWindow(service)
+    window.part_id.setText("housing-ng-source")
+    window.begin_part()
+    window.view.setCurrentIndex(window.view.findData("inner_face"))
+    path = tmp_path / "NG" / "known_ng_part.jpg"
+    path.parent.mkdir()
+    encoded = cv2.imencode(".jpg", np.zeros((100, 200, 3), np.uint8))[1]
+    path.write_bytes(encoded.tobytes())
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *args: (str(path), ""))
+
+    window.inspect_image()
+    wait_until(app, lambda: window._thread is None)
+
+    assert ("file", "inner_face", "housing-ng-source") in service.calls
+    assert window.verdict.text() == "VIEW PASS", "The controlled prediction must not be replaced by a directory label"
     window.close()
 
 

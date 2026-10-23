@@ -148,6 +148,7 @@ class MainWindow(QMainWindow):
         self._job_started = 0.0
         self._job_name = ""
         self._dialogs: list[QWidget] = []
+        self._model_readiness: dict[str, Any] | None = None
         self.setWindowTitle("NeuroIris — Aluminium Vision Inspection | Stavatech")
         self.setStyleSheet(STYLE)
         self._build()
@@ -162,6 +163,7 @@ class MainWindow(QMainWindow):
         self._clock.timeout.connect(self.refresh_status)
         self._clock.start(1000)
         self.refresh_status()
+        self.refresh_model_readiness()
 
     def _build(self) -> None:
         root = QWidget()
@@ -188,6 +190,10 @@ class MainWindow(QMainWindow):
         self.connection = QLabel("Camera stopped · actual resolution and FPS unavailable")
         self.connection.setObjectName("muted")
         layout.addWidget(self.connection)
+        self.model_status = QLabel()
+        self.model_status.setWordWrap(True)
+        self.model_status.setTextFormat(Qt.TextFormat.PlainText)
+        layout.addWidget(self.model_status)
         splitter = QSplitter(Qt.Orientation.Horizontal)
         live_panel = QFrame()
         live_panel.setObjectName("panel")
@@ -386,6 +392,7 @@ class MainWindow(QMainWindow):
         self._worker = None
         self.progress.hide()
         self.refresh_counts()
+        self.refresh_model_readiness()
         self._update_actions()
 
     def selected_view(self) -> str:
@@ -403,6 +410,7 @@ class MainWindow(QMainWindow):
             self._set_verdict("IN PROGRESS")
             self.reasons.setText("Capture the presented face, flip the housing, then capture the opposite face.")
             self._update_coverage()
+            self.refresh_model_readiness()
             self._update_actions()
         except Exception as exc:
             self._error(str(exc))
@@ -498,6 +506,86 @@ class MainWindow(QMainWindow):
         if self._thread is not None:
             self.status.setText(f"{self._job_name} · running for {time.monotonic() - self._job_started:.0f}s")
 
+    def refresh_model_readiness(self, *_: Any) -> None:
+        """Show saved-model availability without constructing inference models."""
+        getter = getattr(self.service, "model_readiness", None)
+        if not callable(getter):
+            self._model_readiness = None
+            self.model_status.hide()
+            return
+        try:
+            report = getter()
+            if not isinstance(report, dict):
+                raise ValueError("Model availability was not reported")
+        except Exception as exc:
+            report = {"ready": False, "views": [], "message": f"Could not check saved models: {exc}"}
+        self._model_readiness = report
+        backend = report.get("backend", self.service.config.get("models", {}).get("backend", ""))
+        summary = [f"Models · {BACKEND_LABELS.get(backend, backend)}"]
+        details = [f"Saved models · {BACKEND_LABELS.get(backend, backend)}"]
+        for row in report.get("views", []):
+            label = VIEW_LABELS.get(row.get("view"), str(row.get("view", "Unknown view")))
+            short_label = label.split(" · ", 1)[0]
+            if row.get("ready"):
+                summary.append(f"{short_label}: available")
+                details.append(f"{label}: available · {row.get('version') or 'saved version'}")
+            else:
+                state = "missing" if row.get("status") == "missing" else "invalid"
+                description = f"{short_label}: {state}"
+                details.append(f"{label}: {row.get('reason') or 'No usable saved model'}")
+                modes = row.get("available_modes", [])
+                if modes:
+                    description += " (" + ", ".join(BACKEND_LABELS.get(mode, mode) for mode in modes) + " saved)"
+                summary.append(description)
+        if not report.get("views") and report.get("message"):
+            summary.append("availability could not be checked")
+            details.append(str(report["message"]))
+        lines = [" · ".join(summary)]
+        if not report.get("ready") and report.get("artifact_root"):
+            lines.append("Model folder: " + str(report["artifact_root"]))
+            details.append(lines[-1])
+        self.model_status.setText("\n".join(lines))
+        self.model_status.setToolTip("\n".join(details))
+        self.model_status.setStyleSheet("color:#b8ccbf;" if report.get("ready") else "color:#ffca54;")
+        self.model_status.show()
+        if not report.get("ready") and not self.last_result and self._thread is None:
+            self._set_verdict("MODEL SETUP NEEDED")
+            self.reasons.setText(str(report.get("message") or "Train or select a saved model for each required face before inspection."))
+        elif report.get("ready") and self.verdict.text() == "MODEL SETUP NEEDED":
+            self._set_verdict("IN PROGRESS" if self.session else "READY")
+            self.reasons.setText("Capture the presented face, flip the housing, then capture the opposite face." if self.session else
+                                 "Start a part session, inspect both main faces, then finalize the part.")
+
+    def _capture_model_available(self, view: str) -> bool:
+        self.refresh_model_readiness()
+        report = self._model_readiness
+        if report is None:
+            return True
+        rows = report.get("views", [])
+        if view == "auto":
+            ready = bool(report.get("ready"))
+            blocked = [row for row in rows if not row.get("ready")]
+        else:
+            row = next((row for row in rows if row.get("view") == view), None)
+            if row is None:
+                try:
+                    optional = self.service.model_readiness(views=[view])
+                    row = next((row for row in optional.get("views", []) if row.get("view") == view), None)
+                except Exception as exc:
+                    row = {"view": view, "ready": False, "reason": str(exc)}
+            ready = bool(row and row.get("ready"))
+            blocked = [row] if row is not None and not ready else []
+        if ready:
+            return True
+        reasons = [f"{VIEW_LABELS.get(row.get('view'), row.get('view'))}: {row.get('reason') or 'No usable saved model'}"
+                   for row in blocked]
+        message = "\n".join(reasons) or str(report.get("message") or f"No saved model is available for {VIEW_LABELS.get(view, view)}.")
+        message += "\nOpen MODEL SETTINGS to select an available mode, or TRAIN MODEL for the required face and mode."
+        self._set_verdict("MODEL SETUP NEEDED")
+        self.reasons.setText(message)
+        self.status.setText("Capture was not analyzed because its selected model is unavailable.")
+        return False
+
     def capture_view(self) -> None:
         if self._latest is None:
             self._error("No current camera frame is available. Reconnect the selected camera.")
@@ -506,6 +594,8 @@ class MainWindow(QMainWindow):
             self._error("Start a part session first.")
             return
         view, identity = self.selected_view(), str(self.session.get("part_id", self.part_id.text()))
+        if not self._capture_model_available(view):
+            return
         self._set_verdict("ANALYZING")
         self.run_task("Selecting stable camera capture", lambda progress: self.service.inspect_live(view, identity), self.on_inspection)
 
@@ -523,6 +613,8 @@ class MainWindow(QMainWindow):
             self._error("Start a part session first.")
             return
         view, identity = self.selected_view(), str(self.session.get("part_id", self.part_id.text()))
+        if not self._capture_model_available(view):
+            return
         self._set_verdict("ANALYZING")
         self.run_task("Analyzing captured view", lambda progress: self.service.inspect_frame(image, view, identity), self.on_inspection)
 
@@ -547,7 +639,7 @@ class MainWindow(QMainWindow):
         self.status.setText("View analyzed. Review the evidence and capture any missing face before finalizing.")
 
     def _set_verdict(self, text: str) -> None:
-        color = "#ff5252" if "FAIL" in text or "NG" == text else "#ffca54" if "RECHECK" in text else "#00E676" if "PASS" in text else "#a8b9ae"
+        color = "#ff5252" if "FAIL" in text or "NG" == text else "#ffca54" if "RECHECK" in text or "SETUP NEEDED" in text else "#00E676" if "PASS" in text else "#a8b9ae"
         self.verdict.setText(text)
         self.verdict.setStyleSheet(f"font-size:40px;font-weight:700;color:{color};padding:8px;")
 
@@ -591,6 +683,11 @@ class MainWindow(QMainWindow):
         self._dialogs.append(dialog)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.destroyed.connect(lambda: self._dialogs.remove(dialog) if dialog in self._dialogs else None)
+        dialog.destroyed.connect(self.refresh_model_readiness)
+        if hasattr(dialog, "finished"):
+            dialog.finished.connect(self.refresh_model_readiness)
+        if hasattr(dialog, "models_changed"):
+            dialog.models_changed.connect(self.refresh_model_readiness)
         dialog.show()
 
     def train_model(self) -> None:

@@ -70,7 +70,20 @@ Official URLs:
 - Teacher: <https://github.com/open-edge-platform/anomalib/releases/download/efficientad_pretrained_weights/efficientad_pretrained_weights.zip>
 - ImageNette: <https://s3.amazonaws.com/fast-ai-imageclas/imagenette2.tgz>
 
-TLS verification and published SHA256 verification remain enabled. An invalid
+HTTPS downloads use `truststore==0.10.5` with a per-request TLS client context.
+On Windows this uses native CryptoAPI certificate-chain construction, including
+retrieval of missing intermediate certificates. Certificate, hostname and date
+checks remain enabled. It does not replace the machine's trusted roots or
+globally change Python's SSL configuration. Install the updated requirements
+when updating an existing environment; pulling source code alone does not
+install new dependencies. To install this dependency directly in the app's
+Windows environment:
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install truststore==0.10.5
+```
+
+Published SHA256 verification also remains enabled. An invalid
 archive is never loaded. Downloads use a temporary file and are finalized only
 after verification. Only the selected teacher file is extracted from the ZIP.
 The cache records its digest and publisher archive provenance for offline reuse.
@@ -105,6 +118,21 @@ archive and extracts it automatically.
 You do not need to create JSON files or unpack the archive manually. An app
 restart or a new training attempt starts a new transfer if no verified archive
 was saved; resuming applies to retries within the same attempt.
+
+`CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate` identifies
+an untrusted or incomplete certificate chain, even when the system clock is
+correct. The error now identifies the asset, URL and cache path instead of
+giving generic clock advice. If native validation still rejects a certificate,
+the browser-download cache procedure above preserves verification and avoids
+substituting untrained weights.
+
+Asset download percentages are separate from training progress. The log labels
+Imagenette and EfficientAD-teacher downloads as **Preparing training assets**;
+optimizer training starts only after both assets are ready. A teacher download
+may fail after Imagenette has reached 99–100%; completed cached assets are kept.
+Only **Training completed** after fitting, calibration, evaluation and model
+publication means a usable model was saved. A download failure leaves the view
+without a new model and cannot produce a defect verdict.
 
 A custom teacher requires both `teacher_path` and its matching `teacher_sha256`.
 That digest establishes local integrity; the adapter labels its provenance as

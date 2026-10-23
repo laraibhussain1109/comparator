@@ -48,6 +48,23 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def https_context() -> ssl.SSLContext:
+    """Use native certificate-chain validation, including Windows CryptoAPI.
+
+    The per-request context applies to HTTPS redirects as well. It avoids a
+    global SSL monkeypatch and keeps hostname/date/issuer verification enabled.
+    """
+    try:
+        from truststore import SSLContext
+    except ImportError as error:
+        raise ModelSetupError(
+            'Native HTTPS certificate support is missing. Install the updated application '
+            'dependencies in the Python environment that runs NeuroIris: '
+            'python -m pip install -r requirements.txt'
+        ) from error
+    return SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+
+
 def verified_download(url: str, path: Path, expected_sha256: str, *,
                       progress: Callable[[str], None] | None = None) -> Path:
     """Retry interrupted HTTPS transfers and publish only checksum-verified files.
@@ -64,6 +81,7 @@ def verified_download(url: str, path: Path, expected_sha256: str, *,
         return path
     if not url.startswith("https://"):
         raise ModelSetupError("Pretrained assets must use verified HTTPS URLs.")
+    context = https_context()
     Path(filesystem_path(path.parent)).mkdir(parents=True, exist_ok=True)
     temporary = path.parent / (".dl-" + uuid4().hex + ".tmp")
     validator = None
@@ -81,7 +99,7 @@ def verified_download(url: str, path: Path, expected_sha256: str, *,
             request = urllib.request.Request(url, headers=headers)
             try:
                 try:
-                    response = urllib.request.urlopen(request, timeout=120)
+                    response = urllib.request.urlopen(request, timeout=120, context=context)
                 except urllib.error.HTTPError as error:
                     if error.code not in {408, 429} and not 500 <= error.code <= 599:
                         error.close()
@@ -90,7 +108,7 @@ def verified_download(url: str, path: Path, expected_sha256: str, *,
                     error.close()
                     raise _DownloadInterrupted(f"HTTP {error.code} {error.reason}") from error
                 except network_errors as error:
-                    _raise_transfer_error(error)
+                    _raise_transfer_error(error, url=url, path=path)
                 with response:
                     if hasattr(response, "geturl") and not response.geturl().startswith("https://"):
                         raise ModelSetupError("Asset download redirected to an unverified HTTP URL.")
@@ -127,7 +145,7 @@ def verified_download(url: str, path: Path, expected_sha256: str, *,
                             try:
                                 chunk = response.read(1024 * 1024)
                             except network_errors as error:
-                                _raise_transfer_error(error)
+                                _raise_transfer_error(error, url=url, path=path)
                             if not chunk:
                                 break
                             if expected_response is not None and received + len(chunk) > expected_response:
@@ -168,11 +186,15 @@ def verified_download(url: str, path: Path, expected_sha256: str, *,
         Path(filesystem_path(temporary)).unlink(missing_ok=True)
 
 
-def _raise_transfer_error(error: Exception) -> None:
+def _raise_transfer_error(error: Exception, *, url: str, path: Path) -> None:
     reason = getattr(error, "reason", error)
     if isinstance(reason, ssl.SSLCertVerificationError):
-        raise ModelSetupError(f"HTTPS certificate verification failed: {reason}. "
-                              "Check the system clock and trusted certificates; verification remains enabled.") from error
+        raise ModelSetupError(
+            f"HTTPS certificate verification failed while downloading {path.name} from {url}: {reason}. "
+            "The server certificate chain was not trusted. Certificate and hostname checks remain enabled. "
+            f"You can download this official archive in a browser and save it at {path}; "
+            "the app will verify its SHA256 before use. Completed cached assets are retained."
+        ) from error
     raise _DownloadInterrupted(str(error)) from error
 
 

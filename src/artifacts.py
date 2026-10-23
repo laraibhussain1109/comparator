@@ -49,7 +49,8 @@ def atomic_json(path: Path, value: object) -> None:
 
 class ArtifactStore:
     def __init__(self, root: Path, product: str):
-        self.root = filesystem_path(root) / safe_name(product)
+        self.product = safe_name(product)
+        self.root = filesystem_path(root) / self.product
 
     @contextmanager
     def staging(self, view: str):
@@ -82,34 +83,83 @@ class ArtifactStore:
         return target
 
     @staticmethod
-    def verify(directory: Path) -> dict:
+    def verify(directory: Path, *, verify_files: bool = True) -> dict:
+        """Validate a bundle, optionally deferring expensive file digest checks."""
         directory = filesystem_path(directory)
         manifest = json.loads((directory / 'manifest.json').read_text(encoding='utf-8'))
-        if manifest.get('schema_version') != 1 or not manifest.get('files'):
+        if (not isinstance(manifest, dict) or manifest.get('schema_version') != 1
+                or not isinstance(manifest.get('files'), dict) or not manifest['files']):
             raise ValueError('Unsupported or incomplete model bundle')
         for name, checksum in manifest['files'].items():
+            if (not isinstance(name, str) or not isinstance(checksum, str)
+                    or not re.fullmatch(r'[0-9a-f]{64}', checksum)):
+                raise ValueError('Model bundle contains an invalid file entry')
             path = directory / name
             if not path.resolve().is_relative_to(directory.resolve()) or path.is_symlink():
                 raise ValueError('Model bundle contains an unsafe path')
-            if not path.is_file() or digest(path) != checksum:
+            if not path.is_file():
+                raise ValueError(f'Model bundle file is missing: {name}')
+            if verify_files and digest(path) != checksum:
                 raise ValueError(f'Model bundle integrity check failed: {name}')
         return manifest
 
-    def active(self, view: str, backend: str) -> Path:
-        pointer = self.root / safe_name(view) / f'active-{safe_name(backend)}.json'
-        if not pointer.is_file():
-            raise FileNotFoundError(f'No trained {backend} model for {view}. Import independent physical parts and train this view first.')
-        version = safe_name(json.loads(pointer.read_text(encoding='utf-8'))['version'])
+    def _validate_selection(self, directory: Path, view: str, backend: str,
+                            version: str, *, verify_files: bool = True) -> dict:
+        parent = self.root / safe_name(view)
+        if not directory.resolve().is_relative_to(parent.resolve()):
+            raise ValueError('Selected model bundle is outside its product/view directory')
+        metadata = self.verify(directory, verify_files=verify_files)
+        if metadata.get('product') != self.product:
+            raise ValueError('Model bundle product does not match the selected product')
+        if metadata.get('view') != view:
+            raise ValueError('Model bundle view does not match the selected view')
+        if metadata.get('version') != version:
+            raise ValueError('Model bundle version does not match the model selection')
+        if backend in {'efficientad', 'hybrid'} and metadata.get('backend') != 'efficientad':
+            raise ValueError('This bundle does not contain EfficientAD weights')
+        if backend == 'geometry' and metadata.get('backend') not in {'geometry', 'efficientad'}:
+            raise ValueError('This bundle does not contain a supported geometry model')
+        return metadata
+
+    def active(self, view: str, backend: str, *, verify_files: bool = True) -> Path:
+        """Resolve an explicit selection, or its compatible neural-mode alias.
+
+        Hybrid and EfficientAD share a trained bundle. An interrupted second
+        pointer write must not hide that bundle, but a present selection is
+        authoritative even when corrupt. No other mode or saved version is
+        selected automatically. ``verify_files=False`` supports cheap readiness
+        checks; inference keeps the default digest verification enabled.
+        """
+        view, backend = safe_name(view), safe_name(backend)
+        if backend not in {'geometry', 'efficientad', 'hybrid'}:
+            raise ValueError('Select geometry, efficientad or hybrid')
+        pointer = self.root / view / f'active-{backend}.json'
+        if not pointer.exists() and not pointer.is_symlink():
+            sibling = {'hybrid': 'efficientad', 'efficientad': 'hybrid'}.get(backend)
+            alias = pointer.with_name(f'active-{sibling}.json') if sibling else None
+            if alias is None or (not alias.exists() and not alias.is_symlink()):
+                mode_guidance = (' Geometry-only models require Geometry mode.'
+                                 if backend in {'hybrid', 'efficientad'} else '')
+                raise FileNotFoundError(
+                    f'No trained {backend} model for {view}. No active selection was found at '
+                    f'{display_path(pointer)}. Open Model Settings to select a compatible saved '
+                    f'model for this face, or complete training for this view.{mode_guidance}')
+            pointer = alias
+        selection = json.loads(pointer.read_text(encoding='utf-8'))
+        if not isinstance(selection, dict) or not isinstance(selection.get('version'), str):
+            raise ValueError(f'Invalid model selection file: {display_path(pointer)}')
+        version = safe_name(selection['version'])
         directory = pointer.parent / version
-        self.verify(directory)
+        self._validate_selection(directory, view, backend, version, verify_files=verify_files)
         return directory
 
     def select(self, view: str, version: str, backend: str) -> None:
-        path = self.root / safe_name(view) / safe_name(version)
-        metadata = self.verify(path)
-        if backend in {'efficientad', 'hybrid'} and metadata['backend'] != 'efficientad':
-            raise ValueError('This bundle does not contain EfficientAD weights')
-        atomic_json(path.parent / f'active-{safe_name(backend)}.json', {'version': version})
+        view, version, backend = safe_name(view), safe_name(version), safe_name(backend)
+        if backend not in {'geometry', 'efficientad', 'hybrid'}:
+            raise ValueError('Select geometry, efficientad or hybrid')
+        path = self.root / view / version
+        self._validate_selection(path, view, backend, version)
+        atomic_json(path.parent / f'active-{backend}.json', {'version': version})
 
     def list(self) -> list[dict]:
         result = []
