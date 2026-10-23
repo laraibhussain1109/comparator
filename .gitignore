@@ -12,3 +12,14 @@ dataset/GOOD/*
 !dataset/GOOD/.gitkeep
 dataset/NG/*
 !dataset/NG/.gitkeep
+runtime/
+dataset/*/GOOD/*
+dataset/*/NG/*
+dataset/manifest.jsonl
+dataset/index.json
+dataset/*.json
+reports/
+weights/
+.neural/
+dataset/.metadata/
+dataset/.rejected/

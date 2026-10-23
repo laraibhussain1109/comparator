@@ -1,17 +1,18 @@
+"""Characterization of deprecated baselines, not NeuroIris production acceptance."""
 from pathlib import Path
 import os
 import cv2,numpy as np
-from src.training.dataset import scan_dataset
-from src.training.splitting import split_dataset
-from src.training.threshold_calibration import calibrate_threshold
-from src.inspection.registration import PartRegistrar
-from src.inspection.geometry import extract_geometry
-from src.inspection.decision_engine import DecisionEngine
-from src.inspection.temporal_filter import TemporalConfirmation
-from src.inspection.part_state_machine import PartStateMachine,PartState
+from src.legacy.dataset import scan_dataset
+from src.legacy.splitting import split_dataset
+from src.legacy.threshold_calibration import calibrate_threshold
+from src.legacy.registration import PartRegistrar
+from src.legacy.geometry import extract_geometry
+from src.legacy.decision_engine import DecisionEngine
+from src.legacy.temporal_filter import TemporalConfirmation
+from src.legacy.part_state_machine import PartStateMachine,PartState
 from src.inspection.defect_renderer import DefectRenderer
 from src.inspection.types import DefectRegion
-from src.inspection.patchcore_detector import PatchCoreDetector
+from src.legacy.handcrafted_memory import HandcraftedPatchMemory
 from src.inspection.golden_bank import GoldenBank
 
 
@@ -59,19 +60,19 @@ def test_renderer_filters_and_does_not_modify_source():
     src=image();before=src.copy();small=np.array([[[1,1]],[[2,1]],[[2,2]],[[1,2]]]);big=np.array([[[10,10]],[[50,10]],[[50,50]],[[10,50]]]);regions=[DefectRegion("x",small,(1,1,2,2),1,"X"),DefectRegion("x",big,(10,10,40,40),1,"X")];r=DefectRenderer(50);out=r.render(src,regions);assert np.array_equal(src,before);assert not np.array_equal(out,src);assert len(r.filter_regions(regions,src.shape))==1
 
 
-def test_patchcore_uses_explicit_logical_cpu_count(monkeypatch):
-    monkeypatch.setattr("src.inspection.patchcore_detector.os.cpu_count", lambda: 6)
-    detector=PatchCoreDetector(patch_size=16,stride=16,max_patches=100)
+def test_handcrafted_memory_uses_explicit_logical_cpu_count(monkeypatch):
+    monkeypatch.setattr("src.legacy.handcrafted_memory.os.cpu_count", lambda: 6)
+    detector=HandcraftedPatchMemory(patch_size=16,stride=16,max_patches=100)
     detector.fit([image()])
     assert detector.model.n_jobs==6
 
 
-def test_patchcore_cpu_count_has_safe_fallback(monkeypatch):
-    monkeypatch.setattr("src.inspection.patchcore_detector.os.cpu_count", lambda: None)
-    assert PatchCoreDetector._cpu_workers()==1
+def test_handcrafted_memory_cpu_count_has_safe_fallback(monkeypatch):
+    monkeypatch.setattr("src.legacy.handcrafted_memory.os.cpu_count", lambda: None)
+    assert HandcraftedPatchMemory._cpu_workers()==1
 
 
-def test_patchcore_config_memory_name_maps_to_detector_argument():
-    patchcore_config={"patch_size":12,"stride":6,"max_memory_patches":321}
-    detector=PatchCoreDetector(**patchcore_config)
+def test_handcrafted_memory_config_memory_name_maps_to_detector_argument():
+    memory_config={"patch_size":12,"stride":6,"max_memory_patches":321}
+    detector=HandcraftedPatchMemory(**memory_config)
     assert detector.max_patches==321
