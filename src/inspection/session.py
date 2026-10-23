@@ -55,15 +55,19 @@ class SessionState(str, Enum):
 
 class InspectionSession:
     def __init__(self, part_id: str,
-                 required_views: tuple[str, ...] = ("inner_face", "ribbed_face")):
+                 required_views: tuple[str, ...] = ("inner_face", "ribbed_face"), *,
+                 inspection_mode: str = "automatic"):
         if not isinstance(part_id, str) or not part_id.strip():
             raise ValueError("A physical part ID is required")
         if not required_views or len(set(required_views)) != len(required_views):
             raise ValueError("Required views must be nonempty and unique")
         if any(not isinstance(v, str) or not v.strip() for v in required_views):
             raise ValueError("Every required view needs an identity")
+        if inspection_mode not in {"automatic", "manual"}:
+            raise ValueError("Inspection mode must be automatic or manual")
         self.part_id = part_id.strip()
         self.required_views = tuple(required_views)
+        self.inspection_mode = inspection_mode
         self.reset_history: list[dict[str, Any]] = []
         self._begin()
 
@@ -130,6 +134,7 @@ class InspectionSession:
         if self.final_decision is not None:
             return deepcopy(self.final_decision)
         metrics: dict[str, Any] = {
+            "inspection_mode": self.inspection_mode,
             "required_views": list(self.required_views),
             "captured_views": list(self.decisions),
             "missing_views": self.missing_views,
@@ -138,6 +143,8 @@ class InspectionSession:
             "view_verdicts": {v: d.verdict for v, d in self.decisions.items()},
             "model_versions": {v: d.model_version for v, d in self.decisions.items()},
         }
+        if self.inspection_mode == "manual":
+            metrics.update(decision_source="operator", inspection_scope="manual")
         candidates = []
         for view, decision in self.decisions.items():
             for candidate in decision.candidates:
@@ -159,7 +166,9 @@ class InspectionSession:
             return ViewDecision("part", "RECHECK", reasons, candidates, metrics)
         scopes = {str(d.metrics.get("inspection_scope", "visual")) for d in self.decisions.values()}
         metrics["inspection_scopes"] = sorted(scopes)
-        if scopes == {"geometry_only"}:
+        if self.inspection_mode == "manual":
+            reasons = ["All mandatory views accepted by the operator"]
+        elif scopes == {"geometry_only"}:
             reasons = ["All mandatory views passed calibrated geometry checks; surface defects were not assessed"]
         else:
             reasons = ["All mandatory views passed their configured calibrated inspection checks"]
@@ -170,6 +179,10 @@ class InspectionSession:
     def finalize(self) -> ViewDecision:
         if self.final_decision is None:
             self.final_decision = self.preview()
+            if self.inspection_mode == "manual":
+                self.final_decision.metrics["display_decision"] = {
+                    "PASS": "OK", "FAIL": "NG", "RECHECK": "View Recheck",
+                }[self.final_decision.verdict]
             self.completed_at = utc_now()
             self.counted = True
             self.state = SessionState.RESULT_LOCKED
@@ -206,6 +219,7 @@ class InspectionSession:
 
     def to_dict(self) -> dict[str, Any]:
         return {"event_id": self.event_id, "part_id": self.part_id,
+                "inspection_mode": self.inspection_mode,
                 "created_at": self.created_at, "completed_at": self.completed_at,
                 "required_views": list(self.required_views), "missing_views": self.missing_views,
                 "state": self.state.value, "counted": self.counted,

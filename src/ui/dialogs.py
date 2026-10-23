@@ -645,6 +645,27 @@ class TrainingDialog(WorkDialog):
                  f"View: {report.get('view', view)} · Backend: {report.get('backend', 'not reported')}",
                  f"Candidate images: {report.get('candidate_images', 'not reported')} · Accepted: {report.get('accepted_images', 'not reported')} · Excluded: {report.get('excluded_images', 'not reported')}",
                  "Original files and labels are retained. Exclusions apply only to this training run."]
+        validation = report.get("validation_screening", {})
+        if isinstance(validation, dict) and validation:
+            lines.append(f"Independent GOOD validation: {validation.get('good_accepted_images', 0)} of {validation.get('good_candidate_images', 0)} accepted · Status: {validation.get('status', 'not reported')}")
+            lines.append("Reserved GOOD physical parts: " + ", ".join(map(str, validation.get("reserved_good_part_ids", []))))
+            if validation.get("expected_source_resolutions"):
+                lines.append("Training source resolutions (width × height): " + ", ".join(
+                    f"{width} × {height}" for width, height in validation["expected_source_resolutions"]))
+        invalid_validation = report.get("invalid_validation_captures", [])
+        if isinstance(invalid_validation, list) and invalid_validation:
+            lines.append("Validation captures requiring recapture (kept in their reserved split):")
+            for entry in invalid_validation:
+                if not isinstance(entry, dict):
+                    continue
+                filename = entry.get("filename") or entry.get("path") or entry.get("sample_id") or "Unnamed sample"
+                lines.append(f"- {filename} · Part: {entry.get('part_id', 'not reported')} · Stage: {entry.get('stage', 'analysis')}")
+                if entry.get("path"):
+                    lines.append("  File: " + str(entry["path"]))
+                reasons = entry.get("reasons", [])
+                lines.append("  Reasons: " + ("; ".join(map(str, reasons)) if isinstance(reasons, list) else str(reasons)))
+                if entry.get("metrics"):
+                    lines.append("  Measured quality: " + json_text(entry["metrics"]))
         excluded = report.get("excluded", [])
         if isinstance(excluded, list) and excluded:
             lines.append("Excluded files:")
@@ -907,6 +928,14 @@ class ModelSettingsDialog(QDialog):
 
 
 class HistoryDialog(QDialog):
+    @staticmethod
+    def display_verdict(record: dict) -> str:
+        decision = record.get("final_decision") or {}
+        verdict = str(record.get("verdict", decision.get("verdict", "")))
+        if record.get("inspection_mode") == "manual":
+            return {"PASS": "OK", "FAIL": "NG", "RECHECK": "View Recheck"}.get(verdict, verdict)
+        return verdict
+
     def __init__(self, service: Any, parent: QWidget | None = None):
         super().__init__(parent)
         self.service = service
@@ -948,7 +977,7 @@ class HistoryDialog(QDialog):
             self.rows = list(reversed(self.service.history()))
             self.table.setRowCount(len(self.rows))
             for row, record in enumerate(self.rows):
-                values = [record.get("part_id", ""), record.get("verdict", record.get("final_decision", {}).get("verdict", "")), record.get("timestamp", record.get("finished_at", "")),
+                values = [record.get("part_id", ""), self.display_verdict(record), record.get("timestamp", record.get("finished_at", "")),
                           ", ".join(record.get("views", {}).keys()) if isinstance(record.get("views"), dict) else str(record.get("views", "")),
                           record.get("evidence_path", record.get("path", ""))]
                 for column, value in enumerate(values):
@@ -968,7 +997,7 @@ class HistoryDialog(QDialog):
                     writer = csv.DictWriter(handle, fieldnames=["part_id", "verdict", "timestamp", "reasons", "missing_views", "record"])
                     writer.writeheader()
                     for row in self.rows:
-                        writer.writerow({"part_id": row.get("part_id"), "verdict": row.get("verdict"), "timestamp": row.get("timestamp", row.get("finished_at", "")),
+                        writer.writerow({"part_id": row.get("part_id"), "verdict": self.display_verdict(row), "timestamp": row.get("timestamp", row.get("finished_at", "")),
                                          "reasons": json_text(row.get("reasons", [])), "missing_views": json_text(row.get("missing_views", [])), "record": json_text(row)})
             except OSError as exc:
                 error(self, exc)
@@ -1125,6 +1154,10 @@ class TechnicalDialog(QDialog):
         export = QPushButton("Export Diagnostic Report…")
         export.clicked.connect(lambda: export_json(self, {"diagnostics": service.diagnostics(), "last_result": last_result}, "neuroiris-diagnostics.json"))
         row.addWidget(export)
+        self.phone_control = QPushButton("Phone Control…")
+        self.phone_control.setEnabled(callable(getattr(parent, "open_phone_control", None)))
+        self.phone_control.clicked.connect(self.open_phone_control)
+        row.addWidget(self.phone_control)
         layout.addLayout(row)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)
@@ -1134,6 +1167,13 @@ class TechnicalDialog(QDialog):
         self.timer.start(2000)
         self.refresh()
         self.display_map(self.map_choice.currentText())
+
+    def open_phone_control(self) -> None:
+        callback = getattr(self.parentWidget(), "open_phone_control", None)
+        if callable(callback):
+            # Release this modal settings window before opening pairing setup.
+            self.accept()
+            QTimer.singleShot(0, callback)
 
     def _find_maps(self, data: Any, prefix: str = "") -> None:
         if isinstance(data, dict):

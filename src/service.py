@@ -64,6 +64,18 @@ class NeuroIrisService:
         self._technician = TechnicianLock(Path(config['paths']['runtime']) / 'technician-lock.json')
         self._saved_event_id = None
         self._capture_after = time.monotonic()
+        self._inspection_mode = 'automatic'
+
+    @property
+    def inspection_mode(self):
+        return self._inspection_mode
+
+    def set_inspection_mode(self, mode):
+        if mode not in {'automatic', 'manual'}:
+            raise ValueError('Inspection mode must be automatic or manual')
+        with self._operation_lock:
+            self._require_idle()
+            self._inspection_mode = mode
 
     @property
     def technician_unlocked(self):
@@ -207,7 +219,8 @@ class NeuroIrisService:
             if self.session is not None and self.session.final_decision is None:
                 raise RuntimeError('Finish or cancel the current physical part first')
             self._require_idle()
-            self.session = InspectionSession(part_id, tuple(self.config['views']['required']))
+            self.session = InspectionSession(part_id, tuple(self.config['views']['required']),
+                                             inspection_mode=self.inspection_mode)
             self._saved_event_id = None
             self._capture_after = time.monotonic()
             with self._recent_lock:
@@ -333,6 +346,8 @@ class NeuroIrisService:
 
     def inspect_frame(self, image, view, part_id, *, capture_type='imported still image; temporal motion not assessed', capture_context=None):
         with self._operation_lock:
+            if self.inspection_mode != 'automatic':
+                raise RuntimeError('Select automatic inspection mode before running model inspection')
             if self.session is None:
                 self.begin_part(part_id)
             if self.session.part_id != str(part_id).strip():
@@ -352,9 +367,38 @@ class NeuroIrisService:
             self._last_data = data
             return {**decision.to_dict(), 'marked_image': marked, 'session': self._session_dict()}
 
+    def record_manual_decision(self, view, verdict, part_id, image=None):
+        """Record an operator assessment with its actual native image, without inference."""
+        with self._operation_lock:
+            if self.inspection_mode != 'manual':
+                raise RuntimeError('Select manual inspection mode before recording an operator decision')
+            if view not in self.config['views']['enabled']:
+                raise ValueError('Select an explicit enabled housing face for manual inspection')
+            if verdict not in {'PASS', 'FAIL', 'RECHECK'}:
+                raise ValueError('Verdict must be PASS, FAIL or RECHECK')
+            if (not isinstance(image, np.ndarray) or image.ndim != 3 or
+                    image.dtype != np.uint8 or image.shape[2] != 3 or min(image.shape[:2]) < 1):
+                raise ValueError('Capture or open a native color image before recording a decision')
+            if self.session is None:
+                self.begin_part(part_id)
+            if self.session.part_id != str(part_id).strip():
+                raise ValueError('The image must belong to the active physical part ID')
+            decision = ViewDecision(view, verdict, ['View inspection complete'], metrics={
+                'decision_source': 'operator', 'inspection_scope': 'manual',
+                'display_decision': {'PASS': 'OK', 'FAIL': 'NG', 'RECHECK': 'View Recheck'}[verdict],
+                'capture_type': 'manual inspection image; automatic capture quality not assessed',
+            })
+            self.session.record(decision)
+            self.frames[view] = image.copy()
+            self.marked[view] = image.copy()
+            self._last_data = None
+            return {**decision.to_dict(), 'marked_image': image.copy(), 'session': self._session_dict()}
+
     def inspect_live(self, view, part_id):
         """Explicit camera provenance: stale stills can never bypass live gates."""
         with self._operation_lock:
+            if self.inspection_mode != 'automatic':
+                raise RuntimeError('Select automatic inspection mode before running model inspection')
             if self.session is None:
                 self.begin_part(part_id)
             if self.session.part_id != str(part_id).strip():
@@ -614,6 +658,53 @@ class NeuroIrisService:
                    f'Report: {report["report_path"]}')
         return template, accepted, aligned, masks
 
+    def _screen_validation_images(self, samples, pipeline, ng_part_ids, screening, emit, *, phase):
+        """Apply live capture gates without fitting to or reassigning validation parts."""
+        validation, invalid = [], []
+        for index, sample in enumerate(samples):
+            emit(20 if phase == 'preflight' else 75, 'Independent validation ' + phase,
+                 f'Checking reserved validation capture {index + 1}/{len(samples)}: {sample.path.name}')
+            data = pipeline.analyze(read_image(sample.path))
+            if data.valid:
+                validation.append((sample, data))
+                continue
+            metrics = dict(data.quality.metrics) if data.quality is not None else {}
+            if data.registration is not None:
+                metrics['registration_confidence'] = data.registration.confidence
+            invalid.append({'sample_id': sample.id, 'part_id': sample.part_id,
+                            'filename': sample.path.name, 'view': sample.view,
+                            'path': display_path(sample.path), 'label': 'NG' if sample.label else 'GOOD',
+                            'stage': data.failure_stage or 'analysis', 'reasons': list(data.reasons),
+                            'metrics': metrics})
+        good_samples = [sample for sample in samples if sample.label == 0 and sample.part_id not in ng_part_ids]
+        valid_good = [(sample, data) for sample, data in validation
+                      if sample.label == 0 and sample.part_id not in ng_part_ids]
+        screening['invalid_validation_captures'] = invalid
+        screening['validation_screening'] = {
+            'phase': phase, 'status': 'passed' if valid_good else 'failed',
+            'candidate_images': len(samples), 'accepted_images': len(validation),
+            'excluded_images': len(invalid), 'good_candidate_images': len(good_samples),
+            'good_accepted_images': len(valid_good),
+            'reserved_good_part_ids': sorted({sample.part_id for sample in good_samples}),
+            'accepted_sample_ids': [sample.id for sample, _ in validation],
+            'expected_source_resolutions': pipeline.metadata.get('source_resolutions', []),
+        }
+        self._save_training_screening(screening)
+        if not valid_good:
+            good_ids = {sample.id for sample in good_samples}
+            blockers = Counter(reason for row in invalid if row['sample_id'] in good_ids
+                               for reason in set(row['reasons']))
+            reasons = '; '.join(f'{reason} ({count} capture(s))' for reason, count in blockers.most_common(3))
+            parts = ', '.join(sorted({sample.part_id for sample in good_samples}))
+            raise ValueError(
+                'No independent GOOD validation captures passed quality and landmark registration; '
+                f'calibration cannot proceed (0 of {len(good_samples)} accepted; reserved parts: {parts}). '
+                f'Validation blockers: {reasons or "no eligible GOOD validation captures"}. '
+                'Review the validation capture details and recapture these same physical parts at the '
+                'training resolution with clear, fully visible housings and identifiable landmarks. '
+                f'Report: {screening["report_path"]}')
+        return validation, valid_good, invalid
+
     def train(self, view, backend='efficientad', progress: Callable | None = None):
         with self._operation_lock:
             self._require_idle()
@@ -698,7 +789,22 @@ class NeuroIrisService:
         with self.artifacts.staging(view) as stage:
             write_image(stage / 'template.png', template)
             geometry.save(stage / 'geometry.npz')
+            # Check all non-neural live gates before expensive network setup and
+            # fitting. The split and training master remain fixed; validation
+            # captures are never used to fit geometry or select a new template.
+            provisional = {'geometry': {'reject_threshold': 1e30, 'recheck_threshold': 1e30},
+                           'anomaly': {'reject_threshold': 1e30, 'recheck_threshold': 1e30}}
+            atomic_json(stage / 'thresholds.json', provisional)
+            self._provisional_manifest(stage, metadata)
+            ng_part_ids = {s.part_id for s in samples if s.label == 1}
+            preflight = ViewPipeline(stage, 'geometry')
+            validation, valid_good, invalid_validation = self._screen_validation_images(
+                selected['validation'], preflight, ng_part_ids, screening, emit, phase='preflight')
             if backend == 'efficientad':
+                # Native validation analyses need not occupy memory during fit.
+                validation.clear()
+                valid_good.clear()
+                del preflight
                 from src.models.efficientad import EfficientADBackend
                 tiles = [tile.image for image, mask in zip(aligned, masks)
                          for tile in tile_image(image, settings['tiling']['tile_size'], settings['tiling']['overlap'], mask)]
@@ -711,31 +817,13 @@ class NeuroIrisService:
                 emit(25, 'EfficientAD', f'Training the real teacher/student/autoencoder on {len(tiles)} GOOD native tiles')
                 neural = model.fit(tiles, stage / 'neural', progress=lambda percent, message: emit(min(72, 25 + int(percent * .47)), 'EfficientAD', message))
                 metadata['neural'] = neural
-            # Fixed provisional limits exist only to collect validation raw scores.
-            provisional = {'geometry': {'reject_threshold': 1e30, 'recheck_threshold': 1e30},
-                           'anomaly': {'reject_threshold': 1e30, 'recheck_threshold': 1e30}}
-            atomic_json(stage / 'thresholds.json', provisional)
-            self._provisional_manifest(stage, metadata)
-            pipeline = ViewPipeline(stage, 'hybrid' if backend == 'efficientad' else 'geometry')
+                # Reuse exactly the same live capture gates with the fitted
+                # neural branch to collect calibration scores.
+                self._provisional_manifest(stage, metadata)
+                pipeline = ViewPipeline(stage, 'hybrid')
+                validation, valid_good, invalid_validation = self._screen_validation_images(
+                    selected['validation'], pipeline, ng_part_ids, screening, emit, phase='calibration')
             emit(75, 'Independent calibration', 'Measuring raw scores on validation parts; test set remains untouched')
-            validation = []
-            invalid_validation = []
-            for sample in selected['validation']:
-                data = pipeline.analyze(read_image(sample.path))
-                if data.valid:
-                    validation.append((sample, data))
-                else:
-                    invalid_validation.append({'sample_id': sample.id, 'part_id': sample.part_id,
-                                               'filename': sample.path.name, 'view': sample.view,
-                                               'path': display_path(sample.path), 'reasons': data.reasons})
-            screening['invalid_validation_captures'] = invalid_validation
-            self._save_training_screening(screening)
-            ng_part_ids = {s.part_id for s in samples if s.label == 1}
-            valid_good = [(s, d) for s, d in validation if s.label == 0 and s.part_id not in ng_part_ids]
-            if not valid_good:
-                raise ValueError('No independent GOOD validation captures passed quality and landmark registration; '
-                                 'calibration cannot proceed. Recapture suitable validation images for the reserved '
-                                 f'physical parts. Report: {screening["report_path"]}')
             branches = 2 if backend == 'efficientad' else 1
             budgets = branches * len(self.config['views']['required'])
             limits = {'part_fpr_target': settings['calibration']['target_fpr'],

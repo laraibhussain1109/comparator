@@ -20,6 +20,7 @@ from src.vision import GeometryProfile, HousingLocator, LandmarkRegistrar, roi_m
 class Analysis:
     valid: bool = False
     reasons: list[str] = field(default_factory=list)
+    failure_stage: str | None = None
     quality: Any = None
     registration: Any = None
     geometry: Any = None
@@ -81,36 +82,43 @@ class ViewPipeline:
         started = time.perf_counter()
         expected = self.metadata.get('source_resolutions', [])
         if expected and [frame.shape[1], frame.shape[0]] not in expected:
+            data.failure_stage = 'resolution'
             data.reasons = ['Input resolution was not represented in training/calibration; recapture at the commissioned native resolution']
             return data
         pose = self.locator.detect(frame)
         if pose is None:
+            data.failure_stage = 'localization'
             data.reasons = ['No complete circular housing was located']
             return data
         data.quality = self.quality.check(frame, mask=pose.mask)
         data.timings['quality_ms'] = (time.perf_counter() - started) * 1000
         if not data.quality.valid or not pose.complete:
+            data.failure_stage = 'quality'
             data.reasons = list(data.quality.reasons) + ([] if pose.complete else ['Housing is clipped by the frame'])
             return data
         began = time.perf_counter()
         data.registration = self.registrar.register(frame)
         data.timings['registration_ms'] = (time.perf_counter() - began) * 1000
         if not data.registration.valid or data.registration.confidence < self.settings['registration']['min_confidence']:
+            data.failure_stage = 'registration'
             data.reasons = list(data.registration.reasons) or ['Insufficient landmark registration confidence']
             return data
         image = data.registration.image
         aligned_pose = self.locator.detect(image)
         if aligned_pose is None or not aligned_pose.complete:
+            data.failure_stage = 'aligned_pose'
             data.reasons = ['Registered housing could not be localized']
             return data
         data.mask = cv2.bitwise_and(aligned_pose.mask, roi_mask(image.shape, self.rois))
         if not np.any(data.mask):
+            data.failure_stage = 'roi'
             data.reasons = ['Inspection ROI contains no part pixels']
             return data
         began = time.perf_counter()
         data.geometry = self.geometry.inspect(image, exclusion_mask=cv2.bitwise_not(roi_mask(image.shape, self.rois)))
         data.timings['geometry_ms'] = (time.perf_counter() - began) * 1000
         if not data.geometry.valid and self.mode != 'efficientad':
+            data.failure_stage = 'geometry'
             data.reasons = ['Geometric measurements could not be established']
             return data
         if self.model is not None:

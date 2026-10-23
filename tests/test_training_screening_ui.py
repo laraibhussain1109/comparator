@@ -187,3 +187,27 @@ def test_provider_without_getter_can_show_embedded_training_report(app):
     assert "this training attempt" in dialog.screening_heading.text()
     assert "Accepted: 6 · Excluded: 2" in dialog.screening_output.toPlainText()
     dialog.close()
+
+
+def test_reserved_validation_failures_show_counts_parts_stages_and_quality_metrics(app):
+    service = ScreeningService()
+    service.latest["validation_screening"] = {
+        "phase": "preflight", "status": "failed", "good_accepted_images": 0,
+        "good_candidate_images": 3, "reserved_good_part_ids": ["actual-housing-2"],
+        "expected_source_resolutions": [[3840, 2160]],
+    }
+    service.latest["invalid_validation_captures"] = [{
+        "sample_id": "validation-blurred", "filename": "<b>reserved-photo</b>.jpg",
+        "path": "/dataset/validation-photo.jpg", "part_id": "actual-housing-2",
+        "stage": "quality", "reasons": ["insufficient_focus"], "metrics": {"sharpness": 2.0},
+    }]
+    dialog = TrainingDialog(service)
+    text = dialog.screening_output.toPlainText()
+    assert "Independent GOOD validation: 0 of 3 accepted" in text
+    assert "Reserved GOOD physical parts: actual-housing-2" in text
+    assert "3840 × 2160" in text
+    assert "kept in their reserved split" in text
+    assert "<b>reserved-photo</b>.jpg" in text
+    assert "Stage: quality" in text and "insufficient_focus" in text
+    assert '"sharpness": 2.0' in text
+    dialog.close()
