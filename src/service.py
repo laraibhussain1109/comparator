@@ -534,6 +534,8 @@ class NeuroIrisService:
         def registered_mask(registration, metrics):
             confidence = float(registration.confidence)
             metrics = {**metrics, 'registration_confidence': confidence if np.isfinite(confidence) else None}
+            if registration.metrics:
+                metrics['registration'] = registration.metrics
             if (not registration.valid or not np.isfinite(registration.confidence) or
                     registration.confidence < settings['registration']['min_confidence']):
                 reasons = list(registration.reasons) if not registration.valid else []
@@ -613,6 +615,63 @@ class NeuroIrisService:
         notify(14, f'Using {len(accepted)} GOOD captures; {report["excluded_images"]} automatically excluded. '
                    f'Report: {report["report_path"]}')
         return template, accepted, aligned, masks
+
+    def _screen_validation_images(self, samples, pipeline, ng_part_ids, report, *, phase):
+        """Check the fixed validation roster and retain actionable failure evidence."""
+        validation, invalid = [], []
+        for sample in samples:
+            if digest(sample.path) != sample.sha256:
+                raise DatasetIntegrityError(f'Validation image bytes changed after inventory: {sample.path}')
+            image = read_image(sample.path)
+            data = pipeline.analyze(image)
+            if data.valid:
+                validation.append((sample, data))
+                continue
+            metrics = {'resolution': [image.shape[1], image.shape[0]],
+                       'expected_resolutions': pipeline.metadata.get('source_resolutions', [])}
+            if data.quality is not None:
+                metrics.update(data.quality.metrics)
+            if data.registration is not None:
+                confidence = float(data.registration.confidence)
+                metrics['registration_confidence'] = confidence if np.isfinite(confidence) else None
+                metrics['minimum_registration_confidence'] = pipeline.settings['registration']['min_confidence']
+                if data.registration.metrics:
+                    metrics['registration'] = data.registration.metrics
+            if data.geometry is not None:
+                metrics['geometry'] = data.geometry.measurements
+            invalid.append({'sample_id': sample.id, 'part_id': sample.part_id,
+                            'filename': sample.path.name, 'view': sample.view,
+                            'path': display_path(sample.path), 'label': 'NG' if sample.label else 'GOOD',
+                            'stage': data.failure_stage, 'reasons': list(data.reasons), 'metrics': metrics})
+        eligible = [s for s in samples if s.label == 0 and s.part_id not in ng_part_ids]
+        valid_good = [(s, d) for s, d in validation if s.label == 0 and s.part_id not in ng_part_ids]
+        eligible_ids = {s.id for s in eligible}
+        reasons = Counter(reason for row in invalid for reason in set(row['reasons']))
+        good_reasons = Counter(reason for row in invalid if row['sample_id'] in eligible_ids
+                               for reason in set(row['reasons']))
+        report['invalid_validation_captures'] = invalid
+        report['validation_screening'] = {
+            'phase': phase, 'candidate_images': len(samples), 'accepted_images': len(validation),
+            'excluded_images': len(invalid), 'candidate_good_images': len(eligible),
+            'accepted_good_images': len(valid_good), 'excluded_good_images': len(eligible) - len(valid_good),
+            'eligible_good_part_ids': sorted({s.part_id for s, _ in valid_good}),
+            'accepted_sample_ids': [s.id for s, _ in validation], 'reason_counts': dict(reasons),
+            'good_rejection_reason_counts': dict(good_reasons),
+        }
+        self._save_training_screening(report)
+        if not valid_good:
+            details = '; '.join(f'{reason} ({count})' for reason, count in good_reasons.most_common())
+            if not eligible:
+                details = 'No GOOD captures from independent non-NG physical parts are assigned to validation'
+            reserved = ', '.join(sorted({s.part_id for s in eligible})) or 'none'
+            raise ValueError(
+                'No independent GOOD validation captures passed inspection checks; calibration cannot proceed. '
+                f'GOOD validation: 0 accepted / {len(eligible)} candidates. Reserved physical parts: {reserved}. '
+                f'Rejection reasons: {details or "No usable validation measurements"}. '
+                'Review the excluded validation files and measurements in Automatic image screening; '
+                'correct capture setup or recapture these reserved parts at the commissioned native resolution. '
+                f'Report: {report["report_path"]}')
+        return validation, valid_good
 
     def train(self, view, backend='efficientad', progress: Callable | None = None):
         with self._operation_lock:
@@ -698,7 +757,24 @@ class NeuroIrisService:
         with self.artifacts.staging(view) as stage:
             write_image(stage / 'template.png', template)
             geometry.save(stage / 'geometry.npz')
+            # Validate capture/registration/geometry gates before downloading
+            # assets or spending optimizer steps on an unusable calibration set.
+            # This uses the same pipeline, fixed split, template and settings;
+            # no validation or test image participates in fitting.
+            provisional = {'geometry': {'reject_threshold': 1e30, 'recheck_threshold': 1e30},
+                           'anomaly': {'reject_threshold': 1e30, 'recheck_threshold': 1e30}}
+            atomic_json(stage / 'thresholds.json', provisional)
+            self._provisional_manifest(stage, metadata)
+            pipeline = ViewPipeline(stage, 'geometry')
+            ng_part_ids = {s.part_id for s in samples if s.label == 1}
+            emit(18, 'Validation image screening',
+                 'Checking reserved validation captures before neural training; test set remains untouched')
+            validation, valid_good = self._screen_validation_images(
+                selected['validation'], pipeline, ng_part_ids, screening, phase='preflight')
             if backend == 'efficientad':
+                # Native validation images can be large. Their measurements
+                # are collected again after fitting, so release them now.
+                del validation, valid_good
                 from src.models.efficientad import EfficientADBackend
                 tiles = [tile.image for image, mask in zip(aligned, masks)
                          for tile in tile_image(image, settings['tiling']['tile_size'], settings['tiling']['overlap'], mask)]
@@ -711,31 +787,15 @@ class NeuroIrisService:
                 emit(25, 'EfficientAD', f'Training the real teacher/student/autoencoder on {len(tiles)} GOOD native tiles')
                 neural = model.fit(tiles, stage / 'neural', progress=lambda percent, message: emit(min(72, 25 + int(percent * .47)), 'EfficientAD', message))
                 metadata['neural'] = neural
-            # Fixed provisional limits exist only to collect validation raw scores.
-            provisional = {'geometry': {'reject_threshold': 1e30, 'recheck_threshold': 1e30},
-                           'anomaly': {'reject_threshold': 1e30, 'recheck_threshold': 1e30}}
-            atomic_json(stage / 'thresholds.json', provisional)
-            self._provisional_manifest(stage, metadata)
-            pipeline = ViewPipeline(stage, 'hybrid' if backend == 'efficientad' else 'geometry')
             emit(75, 'Independent calibration', 'Measuring raw scores on validation parts; test set remains untouched')
-            validation = []
-            invalid_validation = []
-            for sample in selected['validation']:
-                data = pipeline.analyze(read_image(sample.path))
-                if data.valid:
-                    validation.append((sample, data))
-                else:
-                    invalid_validation.append({'sample_id': sample.id, 'part_id': sample.part_id,
-                                               'filename': sample.path.name, 'view': sample.view,
-                                               'path': display_path(sample.path), 'reasons': data.reasons})
-            screening['invalid_validation_captures'] = invalid_validation
-            self._save_training_screening(screening)
-            ng_part_ids = {s.part_id for s in samples if s.label == 1}
-            valid_good = [(s, d) for s, d in validation if s.label == 0 and s.part_id not in ng_part_ids]
-            if not valid_good:
-                raise ValueError('No independent GOOD validation captures passed quality and landmark registration; '
-                                 'calibration cannot proceed. Recapture suitable validation images for the reserved '
-                                 f'physical parts. Report: {screening["report_path"]}')
+            if backend == 'efficientad':
+                self._provisional_manifest(stage, metadata)
+                pipeline = ViewPipeline(stage, 'hybrid')
+                validation, valid_good = self._screen_validation_images(
+                    selected['validation'], pipeline, ng_part_ids, screening, phase='calibration')
+            else:
+                screening['validation_screening']['phase'] = 'calibration'
+            invalid_validation = screening['invalid_validation_captures']
             branches = 2 if backend == 'efficientad' else 1
             budgets = branches * len(self.config['views']['required'])
             limits = {'part_fpr_target': settings['calibration']['target_fpr'],

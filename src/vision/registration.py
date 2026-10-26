@@ -17,6 +17,7 @@ class Registration:
     inverse_matrix: np.ndarray
     reasons: list[str] = field(default_factory=list)
     valid: bool = False
+    metrics: dict = field(default_factory=dict)
 
     def source_points(self, points: np.ndarray) -> np.ndarray:
         """Map aligned defect points back to the original captured image."""
@@ -57,7 +58,8 @@ class LandmarkRegistrar:
         points = np.asarray([k.pt for k in keypoints], np.float32).reshape(-1, 2) / scale
         return points, descriptors
 
-    def _failure(self, image: np.ndarray, reason: str, confidence: float = 0) -> Registration:
+    def _failure(self, image: np.ndarray, reason: str, confidence: float = 0,
+                 metrics: dict | None = None) -> Registration:
         fallback = self._hole_registration(image)
         if fallback is not None:
             return fallback
@@ -66,7 +68,8 @@ class LandmarkRegistrar:
         canvas = np.zeros_like(self.template)
         ch, cw = min(h, image.shape[0]), min(w, image.shape[1])
         canvas[:ch, :cw] = image[:ch, :cw]
-        return Registration(canvas, confidence, np.eye(3), np.eye(3), [reason], False)
+        return Registration(canvas, confidence, np.eye(3), np.eye(3), [reason], False,
+                            metrics or {})
 
     def _hole_registration(self, image: np.ndarray) -> Registration | None:
         """Match an asymmetric constellation when smooth metal defeats ORB.
@@ -214,7 +217,22 @@ class LandmarkRegistrar:
         if span < float(self.settings.get("minimum_landmark_coverage", .025)):
             return self._failure(image, "Internal landmarks occupy too small a region to validate pose")
         if not .5 <= scale <= 2 or center_error > .06 or radius_error > .08 or error > tolerance:
-            return self._failure(image, "Estimated landmark transform disagrees with housing geometry")
+            metrics = {
+                "method": "orb", "estimated_scale": scale, "minimum_scale": .5, "maximum_scale": 2.,
+                "source_center_px": list(pose.center), "template_center_px": list(self.template_pose.center),
+                "source_radius_px": float(pose.radius), "template_radius_px": float(self.template_pose.radius),
+                "center_error_px": float(center_error * self.template_pose.radius),
+                "center_error_radius": float(center_error), "maximum_center_error_radius": .06,
+                "radius_error_fraction": float(radius_error), "maximum_radius_error_fraction": .08,
+                "reprojection_error_px": error, "maximum_reprojection_error_px": tolerance,
+                "matched_landmarks": len(matches), "inlier_landmarks": count, "inlier_ratio": fraction,
+                "landmark_coverage_fraction": float(span),
+                "failed_checks": [name for name, failed in (
+                    ("scale", not .5 <= scale <= 2), ("center", center_error > .06),
+                    ("radius", radius_error > .08), ("reprojection", error > tolerance)) if failed],
+            }
+            return self._failure(image, "Estimated landmark transform disagrees with housing geometry",
+                                 metrics=metrics)
         confidence = float(np.clip(.35 * fraction + .25 * min(1, count / 30)
                                     + .20 * min(1, span / .20)
                                     + .20 * max(0, 1 - error / tolerance), 0, 1))

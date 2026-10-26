@@ -643,12 +643,15 @@ class TrainingDialog(WorkDialog):
         self.screening_heading.setText(scope)
         lines = [f"Run: {run_id or 'not reported'} · Status: {report.get('status', 'not reported')}",
                  f"View: {report.get('view', view)} · Backend: {report.get('backend', 'not reported')}",
+                 "GOOD training captures:",
                  f"Candidate images: {report.get('candidate_images', 'not reported')} · Accepted: {report.get('accepted_images', 'not reported')} · Excluded: {report.get('excluded_images', 'not reported')}",
                  "Original files and labels are retained. Exclusions apply only to this training run."]
-        excluded = report.get("excluded", [])
-        if isinstance(excluded, list) and excluded:
-            lines.append("Excluded files:")
-            for entry in excluded:
+
+        def append_exclusions(entries, heading, measurements):
+            if not isinstance(entries, list) or not entries:
+                return
+            lines.append(heading)
+            for entry in entries:
                 if not isinstance(entry, dict):
                     continue
                 filename = entry.get("filename") or entry.get("path") or entry.get("sample_id") or "Unnamed sample"
@@ -658,7 +661,24 @@ class TrainingDialog(WorkDialog):
                 reasons = entry.get("reasons", [])
                 lines.append("  Reasons: " + ("; ".join(map(str, reasons)) if isinstance(reasons, list) else str(reasons)))
                 if entry.get("metrics"):
-                    lines.append("  Measured quality: " + json_text(entry["metrics"]))
+                    lines.append("  " + measurements + ": " + json_text(entry["metrics"]))
+
+        append_exclusions(report.get("excluded", []), "Excluded training files:", "Measured quality")
+        validation = report.get("validation_screening", {})
+        invalid_validation = report.get("invalid_validation_captures", [])
+        if isinstance(validation, dict) and validation:
+            lines.extend(["", "Independent validation captures:",
+                          f"Candidate images: {validation.get('candidate_images', 'not reported')} · Accepted: {validation.get('accepted_images', 'not reported')} · Excluded: {validation.get('excluded_images', 'not reported')}",
+                          f"GOOD candidate images: {validation.get('candidate_good_images', 'not reported')} · Accepted GOOD: {validation.get('accepted_good_images', 'not reported')} · Excluded GOOD: {validation.get('excluded_good_images', 'not reported')}"])
+            part_ids = validation.get("eligible_good_part_ids")
+            if isinstance(part_ids, list):
+                lines.append("Eligible independent GOOD parts: " + (", ".join(map(str, part_ids)) or "none"))
+        elif isinstance(invalid_validation, list) and invalid_validation:
+            lines.extend(["", "Independent validation captures:",
+                          "Validation totals were not recorded in this report."])
+        if isinstance(invalid_validation, list) and invalid_validation:
+            lines.append("Validation assignments stay fixed; rejected captures cannot calibrate the model.")
+        append_exclusions(invalid_validation, "Rejected validation files:", "Measurements")
         if report.get("error"):
             lines.append("Run error: " + str(report["error"]))
         if report.get("report_path"):

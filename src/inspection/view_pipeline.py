@@ -27,6 +27,7 @@ class Analysis:
     anomaly_score: float | None = None
     mask: np.ndarray | None = None
     timings: dict = field(default_factory=dict)
+    failure_stage: str | None = None
 
 
 def map_candidates(candidates: list[dict], inverse: np.ndarray, shape: tuple, view: str) -> list[dict]:
@@ -81,37 +82,50 @@ class ViewPipeline:
         started = time.perf_counter()
         expected = self.metadata.get('source_resolutions', [])
         if expected and [frame.shape[1], frame.shape[0]] not in expected:
+            data.failure_stage = 'resolution'
             data.reasons = ['Input resolution was not represented in training/calibration; recapture at the commissioned native resolution']
             return data
         pose = self.locator.detect(frame)
         if pose is None:
+            data.failure_stage = 'quality'
             data.reasons = ['No complete circular housing was located']
             return data
         data.quality = self.quality.check(frame, mask=pose.mask)
         data.timings['quality_ms'] = (time.perf_counter() - started) * 1000
         if not data.quality.valid or not pose.complete:
+            data.failure_stage = 'quality'
             data.reasons = list(data.quality.reasons) + ([] if pose.complete else ['Housing is clipped by the frame'])
             return data
         began = time.perf_counter()
         data.registration = self.registrar.register(frame)
         data.timings['registration_ms'] = (time.perf_counter() - began) * 1000
-        if not data.registration.valid or data.registration.confidence < self.settings['registration']['min_confidence']:
-            data.reasons = list(data.registration.reasons) or ['Insufficient landmark registration confidence']
+        if (not data.registration.valid or not np.isfinite(data.registration.confidence)
+                or data.registration.confidence < self.settings['registration']['min_confidence']):
+            data.failure_stage = 'registration'
+            if not data.registration.valid:
+                data.reasons = list(data.registration.reasons) or ['Insufficient landmark registration confidence']
+            elif not np.isfinite(data.registration.confidence):
+                data.reasons = ['Landmark registration confidence is not finite']
+            else:
+                data.reasons = ['Landmark registration confidence is below the configured minimum']
             return data
         image = data.registration.image
         aligned_pose = self.locator.detect(image)
         if aligned_pose is None or not aligned_pose.complete:
+            data.failure_stage = 'aligned_pose'
             data.reasons = ['Registered housing could not be localized']
             return data
         data.mask = cv2.bitwise_and(aligned_pose.mask, roi_mask(image.shape, self.rois))
         if not np.any(data.mask):
+            data.failure_stage = 'roi'
             data.reasons = ['Inspection ROI contains no part pixels']
             return data
         began = time.perf_counter()
         data.geometry = self.geometry.inspect(image, exclusion_mask=cv2.bitwise_not(roi_mask(image.shape, self.rois)))
         data.timings['geometry_ms'] = (time.perf_counter() - began) * 1000
         if not data.geometry.valid and self.mode != 'efficientad':
-            data.reasons = ['Geometric measurements could not be established']
+            data.failure_stage = 'geometry'
+            data.reasons = [data.geometry.measurements.get('error') or 'Geometric measurements could not be established']
             return data
         if self.model is not None:
             began = time.perf_counter()
@@ -134,7 +148,8 @@ class ViewPipeline:
         data = self.analyze(frame)
         if not data.valid:
             decision = ViewDecision(self.view, 'RECHECK', data.reasons,
-                                    metrics={'timings': data.timings}, model_version=self.metadata['version'])
+                                    metrics={'timings': data.timings, 'failure_stage': data.failure_stage},
+                                    model_version=self.metadata['version'])
             return decision, frame.copy(), data
         anomaly = None
         calibration = self.thresholds['geometry']

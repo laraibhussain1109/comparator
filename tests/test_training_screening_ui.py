@@ -187,3 +187,54 @@ def test_provider_without_getter_can_show_embedded_training_report(app):
     assert "this training attempt" in dialog.screening_heading.text()
     assert "Accepted: 6 · Excluded: 2" in dialog.screening_output.toPlainText()
     dialog.close()
+
+
+def test_validation_screening_has_separate_counts_and_per_file_diagnostics(app):
+    service = ScreeningService()
+    service.latest.update(
+        status="failed", error="No independent GOOD validation captures passed inspection screening",
+        validation_screening={"candidate_images": 5, "accepted_images": 1, "excluded_images": 4,
+                              "candidate_good_images": 4, "accepted_good_images": 0,
+                              "excluded_good_images": 4, "eligible_good_part_ids": []},
+        invalid_validation_captures=[
+            {"filename": "<b>validation-housing</b>.png", "part_id": "reserved-part-3",
+             "path": "/operator/dataset/validation-housing.png", "label": 0,
+             "stage": "registration", "reasons": ["Insufficient landmark registration confidence"],
+             "metrics": {"registration_confidence": .23, "sharpness": 73.5}},
+            {"filename": "offset-housing.png", "part_id": "reserved-part-4", "stage": "geometry",
+             "reasons": ["Housing geometry is not aligned with the GOOD profile"],
+             "metrics": {"center_error_px": 38.0}}])
+
+    dialog = TrainingDialog(service)
+
+    text = dialog.screening_output.toPlainText()
+    assert "GOOD training captures:\nCandidate images: 8 · Accepted: 6 · Excluded: 2" in text
+    assert "Independent validation captures:\nCandidate images: 5 · Accepted: 1 · Excluded: 4" in text
+    assert "GOOD candidate images: 4 · Accepted GOOD: 0 · Excluded GOOD: 4" in text
+    assert "Eligible independent GOOD parts: none" in text
+    assert "Rejected validation files:" in text
+    assert "<b>validation-housing</b>.png · Part: reserved-part-3 · Stage: registration" in text
+    assert "Housing geometry is not aligned with the GOOD profile" in text
+    assert '"registration_confidence": 0.23' in text
+    assert '"center_error_px": 38.0' in text
+    assert "Validation assignments stay fixed" in text
+    assert "No independent GOOD validation captures passed inspection screening" in text
+    dialog.close()
+
+
+def test_failed_older_report_displays_validation_reasons_without_inventing_totals(app):
+    service = ScreeningService()
+    service.latest.update(
+        status="failed", error="No independent GOOD validation captures passed quality and landmark registration",
+        invalid_validation_captures=[{"sample_id": "held-out-1", "part_id": "reserved-housing",
+                                      "filename": "held-out-blur.jpg", "reasons": ["insufficient_focus"]}])
+
+    dialog = TrainingDialog(service)
+
+    text = dialog.screening_output.toPlainText()
+    assert "Validation totals were not recorded in this report." in text
+    assert "held-out-blur.jpg · Part: reserved-housing · Stage: not reported" in text
+    assert "Reasons: insufficient_focus" in text
+    assert "Run error: " + service.latest["error"] in text
+    assert "Accepted GOOD: 0" not in text
+    dialog.close()
